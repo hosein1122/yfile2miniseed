@@ -99,6 +99,6 @@ See the [LICENSE](./LICENSE) file for details.
 
 This project builds on:
 
-- [`libmseed`](https://github.com/iris-edu/libmseed) – MiniSEED reading/writing library.
+- [`libmseed`](https://github.com/EarthScope/libmseed) – MiniSEED reading/writing library.
 
 Contributions from the seismology / geophysics community are welcome once the initial refactoring is complete.
