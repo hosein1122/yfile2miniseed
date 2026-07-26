@@ -5,7 +5,7 @@
 #include <vector>
 #include <cstdint>
 
-namespace yfile2miniseed::cli::ziputils 
+namespace yfile2miniseed::cli::ziputils
 {
 
 	// Holds one extracted file from the zip archive

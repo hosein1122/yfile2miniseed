@@ -384,7 +384,7 @@ namespace y5
 
 	struct Tag1_StationInfo
 	{
-		STNID StationID;            //required	
+		STNID StationID;            //required
 		uint8_t NetworkID[51];      // (ASCIIZ)
 		uint8_t SiteName[61];       // (ASCIIZ)
 		uint8_t Comment[31];        // (ASCIIZ)
@@ -473,8 +473,8 @@ namespace y5
 
 	struct Tag3_StationParameters
 	{
-		double StartValidTime;      //number of seconds Since 1970-01-01 
-		double EndValidTime;        //number of seconds Since 1970-01-01 
+		double StartValidTime;      //number of seconds Since 1970-01-01
+		double EndValidTime;        //number of seconds Since 1970-01-01
 		float Sensitivity;          //Nanometers per bit
 		float SensFreq;
 		float SampleRate;           //required
@@ -548,7 +548,7 @@ namespace y5
 
 	struct Tag4_StationDatabase
 	{
-		double LoadDate;                //number of seconds Since 1970-01-01 
+		double LoadDate;                //number of seconds Since 1970-01-01
 		uint8_t Key[16];
 
 		void Reset()

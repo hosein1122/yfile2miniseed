@@ -11,7 +11,7 @@ namespace yfile2miniseed::cli::sid
     /// <summary>
     /// ممکن است برخی اطلاعات y-file ها اشتباه ثبت شده باشد
     /// هدف این کلاس تصحیح و به یاد سپردن تصحیح ها برای کل پروژه هست
-    /// مثلا FAR_SHI_SP_N اشتباه است و باید یه 
+    /// مثلا FAR_SHI_SP_N اشتباه است و باید یه
     /// IR_SHI__SPN تبدیل شود
     /// </summary>
     class SIDCorrector

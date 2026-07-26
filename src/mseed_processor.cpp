@@ -4,7 +4,7 @@
 #include <spdlog/spdlog.h>
 #include <libmseed.h>
 #include <iostream>
-#include <filesystem> 
+#include <filesystem>
 #include <map>
 #include <vector>
 #include <cstring>
@@ -656,7 +656,7 @@ namespace yfile2miniseed {
 		// ------------'----'---
 		//	!*****!    '....'		OkSeg
 		//	!*********!'....'		OkSeg
-		//داده تکراری نیست 
+		//داده تکراری نیست
 		//if (newSeg.end < oldData.start)
 		if (newEnd < oldStart)
 		{
@@ -667,8 +667,8 @@ namespace yfile2miniseed {
 		}
 
 		// Case 6 : new completely after old
-		//            '!*****! 
-		//            '  !***! 
+		//            '!*****!
+		//            '  !***!
 		//	    '.....'				Old Available Data
 		// -----'-----'---------
 		//								No OkSeg!
@@ -698,7 +698,7 @@ namespace yfile2miniseed {
 			return;
 		}
 
-		// Case 2 : overlap at end 
+		// Case 2 : overlap at end
 		//	!**********!			NewSeg
 		//	!**********'**!			NewSeg
 		//	!**********'******!		NewSeg
@@ -1123,7 +1123,7 @@ namespace yfile2miniseed {
 
 				okSeg.Reset();
 
-				// run algorithm 
+				// run algorithm
 				ComputeOkSeg(oldData, newSeg, dT, okSeg);
 				//now newSeg & okSeg has new values as result of compute
 
@@ -1798,7 +1798,7 @@ namespace yfile2miniseed {
 		////.......................................
 		////                    70---90
 		////    10---20
-		////      15-20  
+		////      15-20
 		////                      75-80
 		////.......................................
 		////    10---20       70---90
@@ -1812,7 +1812,7 @@ namespace yfile2miniseed {
 
 		//    10---200       70---90
 		//.......................................
-		//       15------------75  
+		//       15------------75
 		//.......................................
 		//    10-------------------90
 		AddTest2(15, 75, &_stTime, &_samRate, _sid.c_str(), &_data[0]);
