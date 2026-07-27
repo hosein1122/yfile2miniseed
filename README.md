@@ -322,6 +322,40 @@ error_files.txt
 *.lib
 ```
 
+## GitHub Actions And Releases
+
+The repository has a Windows CI workflow at
+`.github/workflows/windows-ci.yml`.
+
+For each push to `main` and each pull request, GitHub Actions builds the
+Release configuration and runs the full CTest suite, including the ObsPy-based
+validation tests.
+
+Build outputs are not committed to git. Instead, the workflow publishes a
+downloadable artifact named `yfile2miniseed-windows-x64.zip`. The package
+contains:
+
+```text
+yfile2mseed.exe
+yfile2miniseed_lib.lib
+include/
+compare_mseed_outputs.py
+compare_mseed_outputs.md
+README.md
+LICENSE
+```
+
+To create an official downloadable GitHub Release, tag a tested commit with a
+version tag such as:
+
+```bat
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+When the tag starts with `v`, GitHub Actions builds the Windows x64 Release
+package and attaches the zip file to that GitHub Release.
+
 ## Migration Notes
 
 This repository is the cleaned-up CMake version of older local Visual Studio

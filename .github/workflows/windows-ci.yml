@@ -1,0 +1,82 @@
+name: Windows CI
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-test-package:
+    name: Build, Test, and Package Windows x64
+    runs-on: windows-latest
+
+    env:
+      BUILD_DIR: ${{ github.workspace }}\out\ci\x64-Release
+      DIST_DIR: ${{ github.workspace }}\out\ci\dist
+      PACKAGE_NAME: yfile2miniseed-windows-x64
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python validation dependencies
+        run: python -m pip install --upgrade pip numpy obspy
+
+      - name: Configure CMake
+        run: >
+          cmake -S . -B "$env:BUILD_DIR"
+          -G "Visual Studio 17 2022"
+          -A x64
+          -DBUILD_TESTING=ON
+
+      - name: Build Release
+        run: cmake --build "$env:BUILD_DIR" --config Release --parallel
+
+      - name: Run tests
+        run: ctest --test-dir "$env:BUILD_DIR" -C Release --output-on-failure
+
+      - name: Prepare package
+        shell: pwsh
+        run: |
+          $packageRoot = Join-Path $env:DIST_DIR $env:PACKAGE_NAME
+          $exe = Get-ChildItem -Path $env:BUILD_DIR -Recurse -Filter "yfile2mseed.exe" | Select-Object -First 1
+          $lib = Get-ChildItem -Path $env:BUILD_DIR -Recurse -Filter "yfile2miniseed_lib.lib" | Select-Object -First 1
+          if (-not $exe) { throw "Could not find yfile2mseed.exe under $env:BUILD_DIR" }
+          if (-not $lib) { throw "Could not find yfile2miniseed_lib.lib under $env:BUILD_DIR" }
+          New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
+          Copy-Item $exe.FullName $packageRoot
+          Copy-Item $lib.FullName $packageRoot
+          Copy-Item "include" "$packageRoot\include" -Recurse
+          Copy-Item "tools\compare_mseed_outputs.py" "$packageRoot\compare_mseed_outputs.py"
+          Copy-Item "tools\compare_mseed_outputs.md" "$packageRoot\compare_mseed_outputs.md"
+          Copy-Item "README.md" $packageRoot
+          Copy-Item "LICENSE" $packageRoot
+          Compress-Archive -Path "$packageRoot\*" -DestinationPath "$env:DIST_DIR\$env:PACKAGE_NAME.zip" -Force
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PACKAGE_NAME }}
+          path: ${{ env.DIST_DIR }}\${{ env.PACKAGE_NAME }}.zip
+          if-no-files-found: error
+
+      - name: Upload package to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.DIST_DIR }}\${{ env.PACKAGE_NAME }}.zip
