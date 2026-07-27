@@ -12,8 +12,9 @@ From a Visual Studio Developer Command Prompt:
 
 ```bat
 cd /d D:\C++Code\yfile2miniseed
-cmake --build out\build\x64-Debug --config Debug
-out\build\x64-Debug\apps\yfile2mseed_cli\yfile2mseed.exe D:\inputYFiles -o D:\OutputStore -V2
+cmake -S . -B out\build\x64-Release -DCMAKE_BUILD_TYPE=Release
+cmake --build out\build\x64-Release --config Release
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\inputYFiles -o D:\OutputStore -V2
 ```
 
 Use `-V2` when you need MiniSEED 2 output, for example when validating with
@@ -66,24 +67,66 @@ The project uses CMake and downloads/builds dependencies with `FetchContent`:
 - zlib
 - libzip
 
+Use a Release build for real conversion work and large datasets. Release is
+optimized and is the recommended build for operational validation. Use Debug
+when changing code, investigating crashes, or stepping through the program in a
+debugger.
+
+### Release Build
+
 Open a Visual Studio Developer Command Prompt and run:
 
 ```bat
 cd /d D:\C++Code\yfile2miniseed
-cmake --build out\build\x64-Debug --config Debug
+cmake -S . -B out\build\x64-Release -DCMAKE_BUILD_TYPE=Release
+cmake --build out\build\x64-Release --config Release
 ```
 
-If the build directory does not exist yet, configure first:
+The Release executable will be here:
+
+```text
+D:\C++Code\yfile2miniseed\out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe
+```
+
+Run the Release test suite:
 
 ```bat
 cd /d D:\C++Code\yfile2miniseed
-cmake -S . -B out\build\x64-Debug -G Ninja -DCMAKE_BUILD_TYPE=Debug
+ctest --test-dir out\build\x64-Release --output-on-failure
+```
+
+### Debug Build
+
+Use this build when developing or debugging:
+
+```bat
+cd /d D:\C++Code\yfile2miniseed
+cmake -S . -B out\build\x64-Debug -DCMAKE_BUILD_TYPE=Debug
 cmake --build out\build\x64-Debug --config Debug
+```
+
+The Debug executable will be here:
+
+```text
+D:\C++Code\yfile2miniseed\out\build\x64-Debug\apps\yfile2mseed_cli\yfile2mseed.exe
+```
+
+Run the Debug test suite:
+
+```bat
+cd /d D:\C++Code\yfile2miniseed
+ctest --test-dir out\build\x64-Debug --output-on-failure
 ```
 
 If you see an error like `cannot open file 'kernel32.lib'`, the command was not
 started from the Visual Studio Developer Command Prompt. Start that prompt and
 run the build again.
+
+If you explicitly want to use Ninja, install Ninja or use the one bundled with
+Visual Studio, then add `-G Ninja` to the configure command.
+
+فارسی کوتاه: برای تبدیل واقعی داده‌ها و حجم بالا از Release استفاده کنید. Debug
+برای توسعه و پیدا کردن خطاست و معمولا کندتر اجرا می‌شود.
 
 ## Run The Converter
 
@@ -96,9 +139,9 @@ yfile2mseed.exe inputPath [-o outputDir] [-R minRamGb] [-V2] [-h]
 Examples:
 
 ```bat
-out\build\x64-Debug\apps\yfile2mseed_cli\yfile2mseed.exe D:\YFiles -o D:\SDS
-out\build\x64-Debug\apps\yfile2mseed_cli\yfile2mseed.exe D:\YFiles -o D:\SDS -V2
-out\build\x64-Debug\apps\yfile2mseed_cli\yfile2mseed.exe D:\one_file.mseed -o D:\SDS -V2
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\YFiles -o D:\SDS
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\YFiles -o D:\SDS -V2
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\one_file.mseed -o D:\SDS -V2
 ```
 
 Arguments:
@@ -137,7 +180,7 @@ Run all tests:
 
 ```bat
 cd /d D:\C++Code\yfile2miniseed
-ctest --test-dir out\build\x64-Debug --output-on-failure
+ctest --test-dir out\build\x64-Release --output-on-failure
 ```
 
 Current test groups:
@@ -192,7 +235,7 @@ runs. Use a separate, immutable copy of the raw Y-File month.
 Run the new converter on the copied input:
 
 ```bat
-out\build\x64-Debug\apps\yfile2mseed_cli\yfile2mseed.exe ^
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe ^
   D:\MSeed_Test\Validation\input_yfiles_copy ^
   -o D:\MSeed_Test\Validation\output_new ^
   -V2
@@ -256,8 +299,8 @@ matches by network, station, location, and final channel letter.
 Run these before committing important changes:
 
 ```bat
-cmake --build out\build\x64-Debug --config Debug
-ctest --test-dir out\build\x64-Debug --output-on-failure
+cmake --build out\build\x64-Release --config Release
+ctest --test-dir out\build\x64-Release --output-on-failure
 git status --short --branch
 ```
 
