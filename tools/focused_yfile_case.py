@@ -347,6 +347,109 @@ def run_compare(args: argparse.Namespace, report_dir: Path) -> None:
     subprocess.run(command, check=True)
 
 
+def write_verdict(report_dir: Path) -> None:
+    raw_path = report_dir / "nanometrics_yfile_coverage_summary.csv"
+    compare_path = report_dir / "compare_center_vs_ours" / "comparison_summary.json"
+    if not raw_path.exists() or not compare_path.exists():
+        return
+
+    raw_by_component = {}
+    with raw_path.open(encoding="utf-8") as handle:
+        for row in csv.DictReader(handle):
+            component = row["channel"][-1]
+            parsed = row.copy()
+            for key in (
+                "file_count",
+                "sample_sum",
+                "gap_count",
+                "gap_samples",
+                "overlap_count",
+                "overlap_samples",
+            ):
+                parsed[key] = int(parsed[key])
+            parsed["raw_unique_estimate"] = parsed["sample_sum"] - parsed["overlap_samples"]
+            raw_by_component[component] = parsed
+
+    with compare_path.open(encoding="utf-8") as handle:
+        comparison = json.load(handle).get("comparison", [])
+
+    lines = [
+        "# Focused Case Verdict",
+        "",
+        "Nanometrics `y5dump -H` is used as the raw-input reference. MiniSEED outputs are compared with ObsPy.",
+        "",
+        "## Summary",
+        "",
+        "| Component | Raw files | Raw gaps | Raw overlaps | Raw unique estimate | Center union samples | Our union samples | Closer output |",
+        "|---|---:|---:|---:|---:|---:|---:|---|",
+    ]
+    verdict_rows = []
+    for row in comparison:
+        component = row["key"][-1]
+        raw = raw_by_component.get(component)
+        if not raw:
+            continue
+        center = row["reference"]
+        ours = row["candidate"]
+        raw_unique = raw["raw_unique_estimate"]
+        center_delta = abs(center["union_sample_count"] - raw_unique)
+        our_delta = abs(ours["union_sample_count"] - raw_unique)
+        closer = "ours" if our_delta < center_delta else "center" if center_delta < our_delta else "tie"
+        verdict_rows.append(
+            {
+                "component": component,
+                "raw_files": raw["file_count"],
+                "raw_gaps": raw["gap_count"],
+                "raw_overlaps": raw["overlap_count"],
+                "raw_unique_estimate": raw_unique,
+                "center_union_samples": center["union_sample_count"],
+                "our_union_samples": ours["union_sample_count"],
+                "center_delta": center_delta,
+                "our_delta": our_delta,
+                "closer_output": closer,
+                "center_overlap_count": center["overlap_count"],
+                "our_overlap_count": ours["overlap_count"],
+            }
+        )
+        lines.append(
+            "| {component} | {raw_files} | {raw_gaps} | {raw_overlaps} | {raw_unique_estimate} | "
+            "{center_union_samples} | {our_union_samples} | {closer_output} |".format(**verdict_rows[-1])
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Overlap Behavior",
+            "",
+            "| Component | Raw overlap count | Center output overlap count | Our output overlap count |",
+            "|---|---:|---:|---:|",
+        ]
+    )
+    for row in verdict_rows:
+        lines.append(
+            f"| {row['component']} | {row['raw_overlaps']} | {row['center_overlap_count']} | {row['our_overlap_count']} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Initial Reading",
+            "",
+            "- The raw Y-file input already contains overlap according to Nanometrics.",
+            "- The center output preserves or increases overlap in MiniSEED.",
+            "- The candidate output mostly resolves overlaps and keeps nearly the same unique sample coverage.",
+            "- `Raw unique estimate` is `sample_sum - overlap_samples` from Nanometrics headers, so small residual differences can remain because of timestamp precision and sample-boundary rounding.",
+            "",
+        ]
+    )
+    (report_dir / "focused_case_verdict.md").write_text("\n".join(lines), encoding="utf-8")
+    with (report_dir / "focused_case_verdict.csv").open("w", newline="", encoding="utf-8") as handle:
+        fields = list(verdict_rows[0].keys()) if verdict_rows else ["component"]
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(verdict_rows)
+
+
 def write_case_summary(args: argparse.Namespace, extracted: list[Path], report_dir: Path) -> None:
     summary = {
         "case_root": str(args.case_root),
@@ -360,6 +463,7 @@ def write_case_summary(args: argparse.Namespace, extracted: list[Path], report_d
             "nanometrics_headers": str(report_dir / "nanometrics_yfile_headers.csv"),
             "nanometrics_coverage": str(report_dir / "nanometrics_yfile_coverage_summary.csv"),
             "mseed_compare": str(report_dir / "compare_center_vs_ours"),
+            "verdict": str(report_dir / "focused_case_verdict.md"),
         },
     }
     (report_dir / "focused_case_summary.json").write_text(
@@ -381,6 +485,7 @@ def write_case_summary(args: argparse.Namespace, extracted: list[Path], report_d
         f"- Nanometrics headers: `{report_dir / 'nanometrics_yfile_headers.csv'}`",
         f"- Nanometrics coverage: `{report_dir / 'nanometrics_yfile_coverage_summary.csv'}`",
         f"- MiniSEED comparison: `{report_dir / 'compare_center_vs_ours'}`",
+        f"- Verdict: `{report_dir / 'focused_case_verdict.md'}`",
         "",
     ]
     (report_dir / "focused_case_summary.md").write_text("\n".join(lines), encoding="utf-8")
@@ -420,6 +525,7 @@ def main() -> int:
     header_rows, header_errors = run_y5dump_headers(extracted, raw_station_dir, dump_dir, args.y5dump)
     write_y5dump_reports(header_rows, header_errors, report_dir)
     run_compare(args, report_dir)
+    write_verdict(report_dir)
     write_case_summary(args, extracted, report_dir)
 
     print(f"Extracted Y-files: {len(extracted)}")

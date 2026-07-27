@@ -85,6 +85,8 @@ nanometrics_yfile_headers.csv         خلاصه هدر همه Y-fileها طبق
 nanometrics_yfile_coverage_summary.csv
                                       تعداد فایل، sample sum، gap و overlap ورودی خام
 compare_center_vs_ours\mismatches.txt اختلاف خروجی مرکز و خروجی ما
+focused_case_verdict.md               جمع‌بندی اینکه خروجی مرکز یا ما به ورودی خام نزدیک‌تر است
+focused_case_verdict.csv              نسخه جدولی همان جمع‌بندی
 focused_case_summary.md               خلاصه پرونده
 focused_case_summary.json             خلاصه ماشینی پرونده
 ```
