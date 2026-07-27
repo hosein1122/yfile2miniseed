@@ -164,6 +164,93 @@ then reads the output with ObsPy and compares timing and sample values. It cover
 If ObsPy is not installed, the ObsPy test is skipped with CTest skip code `77`.
 On this development machine, ObsPy 1.5.0 is installed and the test passes.
 
+## Real Data Validation Against A Reference Converter
+
+For operational confidence, convert the same Y-File dataset with two independent
+paths:
+
+```text
+reference output  National-center converter output
+candidate output  yfile2miniseed output
+judge             tools/compare_mseed_outputs.py using ObsPy
+```
+
+Recommended folder layout:
+
+```text
+D:\MSeed_Test\Validation
+  input_yfiles_copy\
+  output_center\
+  output_new\
+  reports\
+```
+
+Important: do not point `yfile2miniseed` at a live `FilesToConvert` or `Buffer`
+folder from the center converter. That workflow moves and deletes files while it
+runs. Use a separate, immutable copy of the raw Y-File month.
+
+Run the new converter on the copied input:
+
+```bat
+out\build\x64-Debug\apps\yfile2mseed_cli\yfile2mseed.exe ^
+  D:\MSeed_Test\Validation\input_yfiles_copy ^
+  -o D:\MSeed_Test\Validation\output_new ^
+  -V2
+```
+
+After the center converter has finished, compare the two MiniSEED outputs.
+
+Fast header-level check for a full month:
+
+```bat
+python tools\compare_mseed_outputs.py ^
+  --reference D:\MSeed_Test\Any_To_Mseed_Windows\MSeedDatabase ^
+  --candidate D:\MSeed_Test\Validation\output_new ^
+  --report D:\MSeed_Test\Validation\reports\simple ^
+  --level simple ^
+  --id-mode component ^
+  --default-network IR
+```
+
+Medium coverage/gap/overlap check:
+
+```bat
+python tools\compare_mseed_outputs.py ^
+  --reference D:\MSeed_Test\Any_To_Mseed_Windows\MSeedDatabase ^
+  --candidate D:\MSeed_Test\Validation\output_new ^
+  --report D:\MSeed_Test\Validation\reports\medium ^
+  --level medium ^
+  --id-mode component ^
+  --default-network IR
+```
+
+Deep sample-by-sample check for a smaller subset:
+
+```bat
+python tools\compare_mseed_outputs.py ^
+  --reference D:\MSeed_Test\Any_To_Mseed_Windows\MSeedDatabase ^
+  --candidate D:\MSeed_Test\Validation\output_new ^
+  --report D:\MSeed_Test\Validation\reports\deep_SHI ^
+  --level deep ^
+  --station SHI ^
+  --id-mode component ^
+  --default-network IR ^
+  --max-deep-samples 2000000
+```
+
+Report files:
+
+```text
+comparison_summary.csv   Spreadsheet-friendly per-trace-key result.
+comparison_summary.json  Full structured report.
+mismatches.txt           Short list of differences.
+```
+
+Use `--id-mode strict` when metadata must match exactly. Use
+`--id-mode component` when comparing against the old center converter, because
+that code may rewrite channels such as `BHZ` or `SPZ` to `SHZ`; component mode
+matches by network, station, location, and final channel letter.
+
 ## Sanity Checklist Before Push
 
 Run these before committing important changes:

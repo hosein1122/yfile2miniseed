@@ -25,4 +25,15 @@ if(Python3_Interpreter_FOUND)
     set_tests_properties(obspy_steim1_cli PROPERTIES
         SKIP_RETURN_CODE 77
     )
+
+    add_test(
+        NAME compare_mseed_outputs
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/compare_mseed_outputs_test.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/compare_mseed_outputs.py
+    )
+    set_tests_properties(compare_mseed_outputs PROPERTIES
+        SKIP_RETURN_CODE 77
+    )
 endif()
