@@ -209,6 +209,43 @@ On this development machine, ObsPy 1.5.0 is installed and the test passes.
 
 ## Real Data Validation Against A Reference Converter
 
+For repeatable case-by-case validation against the national-center converter,
+use the batch workflow in `tools/run_full_availability_case.bat`.
+
+Example:
+
+```bat
+tools\run_full_availability_case.bat D:\MSeed_Test\Data\Kaz_Test2
+```
+
+This processes every Y-File under the input folder, runs both converters, and
+writes the case result under:
+
+```text
+D:\MSeed_Test\Result\Kaz_Test2
+```
+
+Main outputs:
+
+```text
+center_output\
+our_output\
+yfile_availability.txt
+center_availability.txt
+center_normalized_availability.txt
+our_availability.txt
+center_normalized_vs_our_differences.txt
+```
+
+Use optional filters when needed:
+
+```bat
+tools\run_full_availability_case.bat D:\MSeed_Test\Data\Kaz_Test2 KAZ SP
+tools\run_full_availability_case.bat D:\MSeed_Test\Data\Kaz_Test2 ALL ALL
+```
+
+See `tools/availability_report_tools.md` for the Persian guide.
+
 For operational confidence, convert the same Y-File dataset with two independent
 paths:
 
@@ -339,8 +376,7 @@ contains:
 yfile2mseed.exe
 yfile2miniseed_lib.lib
 include/
-compare_mseed_outputs.py
-compare_mseed_outputs.md
+tools/
 README.md
 LICENSE
 ```

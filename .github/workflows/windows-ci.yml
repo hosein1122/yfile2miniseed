@@ -66,8 +66,7 @@ jobs:
           Copy-Item $exe.FullName $packageRoot
           Copy-Item $lib.FullName $packageRoot
           Copy-Item "include" "$packageRoot\include" -Recurse
-          Copy-Item "tools\compare_mseed_outputs.py" "$packageRoot\compare_mseed_outputs.py"
-          Copy-Item "tools\compare_mseed_outputs.md" "$packageRoot\compare_mseed_outputs.md"
+          Copy-Item "tools" "$packageRoot\tools" -Recurse
           Copy-Item "README.md" $packageRoot
           Copy-Item "LICENSE" $packageRoot
           Compress-Archive -Path "$packageRoot\*" -DestinationPath "$env:DIST_DIR\$env:PACKAGE_NAME.zip" -Force
