@@ -133,6 +133,8 @@ namespace yfile2miniseed {
 
 		bool ReadMSeedTo(const std::string& inputFile, MS3TraceList*& outMstl);
 
+		bool RepackMSeedFileOnce(const std::string& mseedFile, bool miniSeedVersion3);
+
 		static bool CreateDirectoryIfNotExists(const std::string& path);
 
 		static void GetDirectoryAndFileName(

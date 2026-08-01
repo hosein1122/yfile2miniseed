@@ -27,8 +27,8 @@ ObsPy. Without `-V2`, the converter writes MiniSEED 3.
 - Scans folders recursively.
 - Reads Y-Files stored inside ZIP archives.
 - Writes MiniSEED output in SDS layout.
-- Avoids writing duplicate samples when output files already contain the same
-  time range.
+- Uses libmseed read/repack behavior to skip adjacent duplicate MiniSEED
+  records; project code does not clip overlaps during conversion.
 - Builds a reusable static library plus a command-line executable.
 
 ## Folder Guide
@@ -49,7 +49,7 @@ Useful files:
 ```text
 CMakeLists.txt                 Main CMake project.
 apps/yfile2mseed_cli/main.cpp  CLI entry point and argument handling.
-src/mseed_processor.cpp        MiniSEED write/read, SDS export, dedup logic.
+src/mseed_processor.cpp        MiniSEED write/read, SDS export, libmseed repack.
 src/yfile_reader.cpp           Y-File reader wrapper.
 CorrectSID.txt                 Optional local station/channel correction file.
 error_files.txt                Runtime list of files that could not be processed.

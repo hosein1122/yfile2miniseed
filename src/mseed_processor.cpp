@@ -241,6 +241,9 @@ namespace yfile2miniseed {
 			outputFile
 		);
 
+		if (!RepackMSeedFileOnce(outputFile, miniSeedVersion3))
+			return -1;
+
 		return packedrecords;
 	}
 
@@ -312,10 +315,18 @@ namespace yfile2miniseed {
 					BuildSegDay(seg, currentDay, nextDay, segDay);
 					if (segDay.numsamples > 0)
 					{
-						if (AppendSegDayAvoidDuplicate(out_mstl, tid->sid, segDay, seg->samprate, oldDataDic))
-						{
-							recordAddedForThisDay = true;
-						}
+						// Decision 2026-08-01: do not use project-owned overlap or
+						// duplicate clipping here. Append the day slice as-is and
+						// rely on libmseed read/repack behavior plus later ObsPy cleanup.
+						AddNewDataTo(
+							out_mstl,
+							tid->sid,
+							segDay.dataPtr,
+							segDay.numsamples,
+							segDay.start,
+							seg->samprate
+						);
+						recordAddedForThisDay = true;
 					}
 
 					//اگر سگمنت فعلی بزرگتر از محدوده روز جاری است. نیازی نیست به سگمنت بعدی برویم
@@ -356,6 +367,12 @@ namespace yfile2miniseed {
 					else
 					{
 						spdlog::info("Wrote {} records to '{}'", packedrecords, mseedFile);
+						if (!RepackMSeedFileOnce(mseedFile, miniSeedVersion3))
+						{
+							if (out_mstl)
+								mstl3_free(&out_mstl, 1);
+							return false;
+						}
 						anyNewFileWritten = true;
 					}
 				}
@@ -499,7 +516,10 @@ namespace yfile2miniseed {
 			return false;
 		}
 
-		constexpr uint32_t flags = MSF_VALIDATECRC | MSF_UNPACKDATA;
+		constexpr uint32_t flags =
+			MSF_VALIDATECRC |
+			MSF_UNPACKDATA |
+			MSF_SKIPADJACENTDUPLICATES;
 
 		int retcode = ms3_readtracelist(
 			&outMstl,
@@ -517,6 +537,48 @@ namespace yfile2miniseed {
 
 		spdlog::info("Successfully read MiniSEED file '{}'", inputFile);
 
+		return true;
+	}
+
+	bool MSeedProcessor::RepackMSeedFileOnce(const std::string& mseedFile, bool miniSeedVersion3)
+	{
+		// With the current libmseed behavior, MSF_SKIPADJACENTDUPLICATES only
+		// drops adjacent duplicate records while reading. A write/read/write pass
+		// can turn non-adjacent duplicates into adjacent ones, then skip them.
+		MS3TraceList* repackList = nullptr;
+		if (!ReadMSeedTo(mseedFile, repackList))
+		{
+			spdlog::error("RepackMSeedFileOnce: cannot read '{}'", mseedFile);
+			return false;
+		}
+
+		uint32_t flags = MSF_FLUSHDATA;
+		if (!miniSeedVersion3)
+			flags |= MSF_PACKVER2;
+
+		const int64_t packedrecords = mstl3_writemseed(
+			repackList,
+			mseedFile.c_str(),
+			1,
+			this->reclen,
+			this->encoding,
+			flags,
+			this->verbose
+		);
+
+		mstl3_free(&repackList, 1);
+
+		if (packedrecords < 0)
+		{
+			spdlog::error(
+				"RepackMSeedFileOnce: mstl3_writemseed() failed for '{}' (code={})",
+				mseedFile,
+				packedrecords
+			);
+			return false;
+		}
+
+		spdlog::info("Repacked '{}' with {} MiniSEED records", mseedFile, packedrecords);
 		return true;
 	}
 
