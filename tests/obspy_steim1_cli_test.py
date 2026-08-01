@@ -23,6 +23,10 @@ def write_steim1(path, data, starttime, sampling_rate):
 
 
 def run_cli(cli, input_path, output_dir):
+    (output_dir.parent / "CorrectSID.txt").write_text(
+        "IR_TST__BHZ => IR_TST__BHZ\n",
+        encoding="utf-8",
+    )
     result = subprocess.run(
         [str(cli), str(input_path), "-o", str(output_dir), "-V2"],
         cwd=str(output_dir.parent),

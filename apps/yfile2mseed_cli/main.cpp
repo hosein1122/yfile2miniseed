@@ -26,7 +26,6 @@ namespace fs = std::filesystem;
 bool miniSeedVersion3 = true;
 
 //using namespace std;
-yfile2miniseed::cli::sid::SIDCorrector sidCorrector("CorrectSID.txt");
 
 static bool DoWriteMemoryToDisk(
 	yfile2miniseed::MSeedProcessor& processor,
@@ -52,6 +51,7 @@ static bool DoWriteMemoryToDisk(
 static bool ProcessCurrentY(
 	yfile2miniseed::Y5FileReader& reader,
 	yfile2miniseed::MSeedProcessor& processor,
+	yfile2miniseed::cli::sid::SIDCorrector& sidCorrector,
 	const std::string& outputDir,
 	size_t& TotalRAMSampleNum,
 	size_t minRamInt
@@ -59,7 +59,7 @@ static bool ProcessCurrentY(
 {
 	yfile2miniseed::cli::sid::SIDCorrector::CorrectedEntry corrected;
 
-	bool ok = sidCorrector.GetCorrectedInteractive(
+	bool ok = sidCorrector.GetCorrected(
 		(const char*)reader.t1.NetworkID,
 		(const char*)reader.t1.StationID.Station,
 		(const char*)reader.t1.StationID.Location,
@@ -69,6 +69,15 @@ static bool ProcessCurrentY(
 
 	if (!ok)
 	{
+		spdlog::error(
+			"Missing CorrectSID.txt entry for raw SID '{}_{}_{}_{}'. "
+			"Run yfile2mseed_sid_scan on the input path, review CorrectSID.txt, then run yfile2mseed again.",
+			(const char*)reader.t1.NetworkID,
+			(const char*)reader.t1.StationID.Station,
+			(const char*)reader.t1.StationID.Location,
+			(const char*)reader.t1.StationID.Channel
+		);
+		return false;
 		// اگر در آینده حالت لغو کاربر را اضافه کردیم، می‌توانی اینجا تصمیم بگیری چه کار کنی
 		// فعلاً همیشه true برمی‌گردد
 	}
@@ -174,10 +183,10 @@ int main(int argc, char* argv[])
 	{
 		std::cout
 			<< "usage:\n"
-			<< "\tHF_Y2MSeed inputDir [-o outputDir] [-R MinRAM]" << std::endl
+			<< "\tyfile2mseed inputPath [-o outputDir] [-R MinRAM] [-V2]" << std::endl
 			<< "\twhere : " << std::endl
 
-			<< "\t  " << std::setw(15) << std::left << "inputDir" << "- input directory of Y - Files(version5.0)" << std::endl
+			<< "\t  " << std::setw(15) << std::left << "inputPath" << "- input directory or file containing Y-Files, ZIPs, or MiniSEED" << std::endl
 
 			<< "\t  " << std::setw(15) << std::left << "-o outputDir" << "- optional output path for saving MSeed files there. (default: 'OutPutStore')" << std::endl
 
@@ -185,10 +194,12 @@ int main(int argc, char* argv[])
 			<< "\t  " << std::setw(15) << std::left << "-V2" << "- Using this option, miniSeed will be written as Version 2 othervise it will write as miniSeed Version 3 " << std::endl
 			<< "\t  " << std::setw(15) << std::left << "-h" << "- show help" << std::endl
 			<< std::endl
+			<< "Before converting Y-files, run yfile2mseed_sid_scan and review CorrectSID.txt.\n"
+			<< std::endl
 			<< "example:\n"
-			<< "\tHF_Y2MSeed D:\\inputYFileDir  -o D:\\OutputStore -R 4 \n"
-			<< "\tHF_Y2MSeed inputYFileDir  -o OutputStore \n"
-			<< "\tHF_Y2MSeed D:\\inputYFileDir\n"
+			<< "\tyfile2mseed_sid_scan D:\\inputYFileDir -o CorrectSID.txt\n"
+			<< "\tyfile2mseed D:\\inputYFileDir -o D:\\OutputStore -R 4 -V2\n"
+			<< "\tyfile2mseed D:\\inputMSeedDir -o D:\\OutputStore -V2\n"
 			<< std::endl << std::endl;
 
 		return 0;
@@ -196,6 +207,26 @@ int main(int argc, char* argv[])
 
 	if (inputDir == "")
 		return 0;
+
+	if (!std::filesystem::exists("CorrectSID.txt"))
+	{
+		spdlog::error(
+			"CorrectSID.txt was not found. "
+			"Run yfile2mseed_sid_scan on the input path first, review CorrectSID.txt, then run yfile2mseed."
+		);
+		return 2;
+	}
+
+	yfile2miniseed::cli::sid::SIDCorrector sidCorrector("CorrectSID.txt");
+
+	if (!sidCorrector.HasCorrections())
+	{
+		spdlog::error(
+			"CorrectSID.txt is missing, empty, or has no valid entries. "
+			"Run yfile2mseed_sid_scan on the input path first, review CorrectSID.txt, then run yfile2mseed."
+		);
+		return 2;
+	}
 
 	std::vector<std::string> files;
 	fs::path inputPath(inputDir);
@@ -320,6 +351,7 @@ int main(int argc, char* argv[])
 					if (ProcessCurrentY(
 						reader,
 						processor,
+						sidCorrector,
 						outputDir,
 						TotalRAMSampleNum,
 						minRamInt))
@@ -361,6 +393,7 @@ int main(int argc, char* argv[])
 					if (ProcessCurrentY(
 						reader,
 						processor,
+						sidCorrector,
 						outputDir,
 						TotalRAMSampleNum,
 						minRamInt))

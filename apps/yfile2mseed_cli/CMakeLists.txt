@@ -22,3 +22,20 @@ target_include_directories(yfile2mseed_cli
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+add_executable(yfile2mseed_sid_scan
+    sid_inventory_main.cpp
+    filesystem/file_discovery.cpp
+    utils/zip_utils.cpp
+)
+
+target_link_libraries(yfile2mseed_sid_scan
+    PRIVATE
+        yfile2miniseed_lib
+        libzip::zip
+)
+
+target_include_directories(yfile2mseed_sid_scan
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)

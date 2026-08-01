@@ -239,6 +239,29 @@ namespace yfile2miniseed::cli::sid
         return true;
     }
 
+    bool SIDCorrector::GetCorrected(
+        const std::string& rawNetwork,
+        const std::string& rawStation,
+        const std::string& rawLocation,
+        const std::string& rawChannel,
+        CorrectedEntry& corrected) const
+    {
+        const std::string rawKey =
+            BuildKey(rawNetwork, rawStation, rawLocation, rawChannel);
+
+        auto it = m_corrections.find(rawKey);
+        if (it == m_corrections.end())
+            return false;
+
+        corrected = it->second;
+        return true;
+    }
+
+    bool SIDCorrector::HasCorrections() const
+    {
+        return !m_corrections.empty();
+    }
+
     void SIDCorrector::SortAndRewriteFile()
     {
         std::ofstream out(m_filePath, std::ios::out | std::ios::trunc);

@@ -39,6 +39,15 @@ namespace yfile2miniseed::cli::sid
             const std::string& rawChannel,
             CorrectedEntry& corrected);
 
+        bool GetCorrected(
+            const std::string& rawNetwork,
+            const std::string& rawStation,
+            const std::string& rawLocation,
+            const std::string& rawChannel,
+            CorrectedEntry& corrected) const;
+
+        bool HasCorrections() const;
+
         void SaveAndCompactFile();
 
     private:

@@ -104,6 +104,7 @@ The package contains:
 
 ```text
 yfile2mseed.exe
+yfile2mseed_sid_scan.exe
 yfile2miniseed_lib.lib
 include/
 tools/

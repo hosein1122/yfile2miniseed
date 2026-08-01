@@ -59,11 +59,14 @@ jobs:
         run: |
           $packageRoot = Join-Path $env:DIST_DIR $env:PACKAGE_NAME
           $exe = Get-ChildItem -Path $env:BUILD_DIR -Recurse -Filter "yfile2mseed.exe" | Select-Object -First 1
+          $sidScanExe = Get-ChildItem -Path $env:BUILD_DIR -Recurse -Filter "yfile2mseed_sid_scan.exe" | Select-Object -First 1
           $lib = Get-ChildItem -Path $env:BUILD_DIR -Recurse -Filter "yfile2miniseed_lib.lib" | Select-Object -First 1
           if (-not $exe) { throw "Could not find yfile2mseed.exe under $env:BUILD_DIR" }
+          if (-not $sidScanExe) { throw "Could not find yfile2mseed_sid_scan.exe under $env:BUILD_DIR" }
           if (-not $lib) { throw "Could not find yfile2miniseed_lib.lib under $env:BUILD_DIR" }
           New-Item -ItemType Directory -Force -Path $packageRoot | Out-Null
           Copy-Item $exe.FullName $packageRoot
+          Copy-Item $sidScanExe.FullName $packageRoot
           Copy-Item $lib.FullName $packageRoot
           Copy-Item "include" "$packageRoot\include" -Recurse
           Copy-Item "tools" "$packageRoot\tools" -Recurse

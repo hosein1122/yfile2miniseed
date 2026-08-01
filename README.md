@@ -21,6 +21,7 @@ From a Visual Studio Developer Command Prompt:
 cd /d D:\C++Code\yfile2miniseed
 cmake -S . -B out\build\x64-Release -DCMAKE_BUILD_TYPE=Release
 cmake --build out\build\x64-Release --config Release
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_sid_scan.exe D:\inputYFiles -o CorrectSID.txt
 out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\inputYFiles -o D:\OutputStore -V2
 ```
 
@@ -40,6 +41,7 @@ support that is not assumed by this project.
 - Scans folders recursively.
 - Reads Y-Files stored inside ZIP archives.
 - Writes MiniSEED output in SDS layout.
+- Builds a `CorrectSID.txt` template from input Y-file headers.
 - Uses libmseed read/repack behavior to skip adjacent duplicate MiniSEED
   records.
 - Does not perform full deduplication or overlap cleanup in project C++ code.
@@ -65,12 +67,14 @@ Useful files:
 ```text
 CMakeLists.txt                 Main CMake project.
 apps/yfile2mseed_cli/main.cpp  CLI entry point and argument handling.
+apps/yfile2mseed_cli/sid_inventory_main.cpp
+                               CorrectSID.txt inventory/template builder.
 src/mseed_processor.cpp        MiniSEED write/read, SDS export, libmseed repack.
 src/yfile_reader.cpp           Y-File reader wrapper.
 tools/README.md                Guide to validation and ObsPy cleanup tools.
 tools/sds_obspy_cleanup_inplace.py
                                In-place SDS cleanup with ObsPy merge(method=-1).
-CorrectSID.txt                 Optional local station/channel correction file.
+CorrectSID.txt                 Required local station/channel correction file.
 error_files.txt                Runtime list of files that could not be processed.
 ```
 
@@ -146,6 +150,48 @@ Visual Studio, then add `-G Ninja` to the configure command.
 
 فارسی کوتاه: برای تبدیل واقعی داده‌ها و حجم بالا از Release استفاده کنید. Debug
 برای توسعه و پیدا کردن خطاست و معمولا کندتر اجرا می‌شود.
+
+## Recommended Workflow
+
+0. Choose the input folder that contains Y-files, ZIP files, or MiniSEED files.
+1. Build or update `CorrectSID.txt`, then review it manually:
+
+```bat
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_sid_scan.exe ^
+  D:\YFiles ^
+  -o CorrectSID.txt
+```
+
+2. Run the converter:
+
+```bat
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe ^
+  D:\YFiles ^
+  -o D:\SDS ^
+  -V2
+```
+
+3. Run ObsPy cleanup with `merge(method=-1)`:
+
+```bat
+python tools\sds_obspy_cleanup_inplace.py ^
+  --sds-root D:\SDS ^
+  --workers 8 ^
+  --encoding STEIM2 ^
+  --reclen 4096 ^
+  --report D:\SDS_cleanup_report
+```
+
+4. Optionally compare against another SDS archive:
+
+```bat
+python tools\compare_mseed_outputs.py ^
+  --reference D:\ExistingSDS ^
+  --candidate D:\SDS ^
+  --report D:\SDS_compare_report ^
+  --level medium ^
+  --id-mode strict
+```
 
 ## Run The Converter
 
@@ -251,9 +297,21 @@ See [tools/README.md](tools/README.md) for the full tools guide.
 
 ## CorrectSID.txt
 
-The CLI uses `CorrectSID.txt` for local source identifier corrections. Keep this
-file next to the executable or run the converter from a folder where the file is
-available.
+The converter uses `CorrectSID.txt` for local source identifier corrections.
+Run `yfile2mseed_sid_scan` before conversion to build a template from the input
+Y-file headers. Existing entries are preserved, so you can safely rerun the scan
+after adding new input files.
+
+Each line maps the raw SID fields from the input file to the corrected values:
+
+```text
+RAWNET_RAWSTA_RAWLOC_RAWCHA => NET_STA_LOC_CHA
+```
+
+The converter no longer waits for keyboard input when it sees a new SID. If
+`CorrectSID.txt` is missing, empty, or does not contain a needed mapping, it
+prints an error and stops. This prevents long unattended runs from silently
+waiting for user input.
 
 The file is ignored by git because it is local/operator-specific.
 
