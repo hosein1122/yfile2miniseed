@@ -27,6 +27,11 @@ out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\inputYFiles -o D:\
 Use `-V2` when you need MiniSEED 2 output, for example when validating with
 ObsPy. Without `-V2`, the converter writes MiniSEED 3.
 
+Use `-V2` for any workflow that uses the ObsPy tools in `tools/`, including
+post-conversion duplicate/overlap cleanup. ObsPy's built-in MiniSEED support is
+for MiniSEED 2 on this development setup; MiniSEED 3 requires separate plugin
+support that is not assumed by this project.
+
 ## What This Project Does
 
 - Reads Nanometrics Y-File version 5 records.
@@ -59,6 +64,9 @@ CMakeLists.txt                 Main CMake project.
 apps/yfile2mseed_cli/main.cpp  CLI entry point and argument handling.
 src/mseed_processor.cpp        MiniSEED write/read, SDS export, libmseed repack.
 src/yfile_reader.cpp           Y-File reader wrapper.
+tools/README.md                Guide to validation and ObsPy cleanup tools.
+tools/sds_obspy_cleanup_inplace.py
+                               In-place SDS cleanup with ObsPy merge(method=-1).
 CorrectSID.txt                 Optional local station/channel correction file.
 error_files.txt                Runtime list of files that could not be processed.
 ```
@@ -158,7 +166,8 @@ Arguments:
 inputPath      Input folder or single file.
 -o outputDir   Output SDS root. Default: OutPutStore
 -R minRamGb    Approximate RAM threshold before flushing data. Default: 2
--V2            Write MiniSEED 2 instead of MiniSEED 3.
+-V2            Write MiniSEED 2 instead of MiniSEED 3. Recommended before
+               running ObsPy tools.
 -h             Show help.
 ```
 
@@ -173,6 +182,30 @@ Example:
 ```text
 D:\SDS\2020\IR\TST\BHZ.D\IR.TST..BHZ.D.2020.001.mseed
 ```
+
+## ObsPy SDS Cleanup
+
+After conversion, use `tools/sds_obspy_cleanup_inplace.py` when you want ObsPy
+to remove compatible duplicates and safe overlaps in the SDS archive itself:
+
+```bat
+python tools\sds_obspy_cleanup_inplace.py ^
+  --sds-root D:\SDS ^
+  --workers 8 ^
+  --encoding STEIM2 ^
+  --reclen 4096 ^
+  --report D:\SDS_cleanup_report
+```
+
+Start with `--dry-run` on a new dataset. The cleanup tool rewrites files in
+place; it does not copy the SDS tree to a different output folder. Use
+`--backup-suffix .bak` if you want original files preserved next to the cleaned
+files.
+
+This tool uses ObsPy `Stream.merge(method=-1)`, which is conservative. It does
+not force conflicting overlap sample values into a single trace. For this
+workflow, generate MiniSEED 2 with `-V2`; plain ObsPy does not handle MiniSEED 3
+in this project setup.
 
 ## CorrectSID.txt
 

@@ -42,3 +42,7 @@ compile_commands.json
 error_files.txt
 CorrectSID.txt
 logs/
+
+# Python tooling
+__pycache__/
+*.py[cod]
