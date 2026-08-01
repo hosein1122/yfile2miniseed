@@ -35,7 +35,8 @@ support that is not assumed by this project.
 ## What This Project Does
 
 - Reads Nanometrics Y-File version 5 records.
-- Reads MiniSEED input files as well as Y-Files.
+- Reads MiniSEED input files as well as Y-Files. For example, you can pass a
+  folder of standalone MiniSEED files and rewrite them into the SDS layout.
 - Scans folders recursively.
 - Reads Y-Files stored inside ZIP archives.
 - Writes MiniSEED output in SDS layout.
@@ -51,6 +52,7 @@ apps/yfile2mseed_cli/          Command-line application.
 include/yfile2miniseed/        Public library headers.
 include/yfile2miniseed/detail/ Y-File v5 parser internals.
 src/                           Library implementation.
+tools/                         Validation, reporting, and ObsPy cleanup tools.
 tests/                         CTest tests, including ObsPy/STEIM1 validation.
 cmake/modules/                 Local CMake find modules.
 out/                           Local build output. Ignored by git.
@@ -158,6 +160,7 @@ Examples:
 out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\YFiles -o D:\SDS
 out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\YFiles -o D:\SDS -V2
 out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\one_file.mseed -o D:\SDS -V2
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\LooseMSeedFiles -o D:\SDS -V2
 ```
 
 Arguments:

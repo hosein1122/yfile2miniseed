@@ -31,6 +31,10 @@ python tools\sds_obspy_cleanup_inplace.py ^
   --report D:\SDS_cleanup_report
 ```
 
+This rewrites the SDS files in the same location. Use `--dry-run` first if you
+only want to inspect what would be processed, or `--backup-suffix .bak` if you
+want a copy of each original file before replacement.
+
 Start with a dry run for new datasets:
 
 ```bat
