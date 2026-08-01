@@ -4,6 +4,13 @@
 writes the result in an SDS-style folder layout. It can also read existing
 MiniSEED input and rewrite it into the same SDS output tree.
 
+The converter intentionally keeps the C++ conversion path simple: it slices data
+into daily MiniSEED files and does not run project-owned overlap cleanup or full
+deduplication. Duplicate handling in this stage is limited to libmseed
+read/repack behavior for adjacent duplicate records. Any deeper overlap cleanup
+or sample-aware deduplication should be done in a separate ObsPy post-processing
+step.
+
 The main target platform is Windows with Visual Studio/MSVC.
 
 ## Quick Start
@@ -28,7 +35,8 @@ ObsPy. Without `-V2`, the converter writes MiniSEED 3.
 - Reads Y-Files stored inside ZIP archives.
 - Writes MiniSEED output in SDS layout.
 - Uses libmseed read/repack behavior to skip adjacent duplicate MiniSEED
-  records; project code does not clip overlaps during conversion.
+  records.
+- Does not perform full deduplication or overlap cleanup in project C++ code.
 - Builds a reusable static library plus a command-line executable.
 
 ## Folder Guide
@@ -186,12 +194,15 @@ ctest --test-dir out\build\x64-Release --output-on-failure
 Current test groups:
 
 ```text
-compute_okseg       C++ property/simulation tests for duplicate/overlap logic.
+compute_okseg       Legacy C++ property/simulation tests for the disabled
+                    duplicate/overlap clipping helper.
 obspy_steim1_cli    Python/ObsPy CLI validation using STEIM1 MiniSEED input.
 ```
 
 The ObsPy test creates synthetic STEIM1 MiniSEED input, runs the CLI with `-V2`,
-then reads the output with ObsPy and compares timing and sample values. It covers:
+then reads the output with ObsPy and compares timing and sample values. These
+tests are regression checks for conversion output, not a claim that the C++
+converter performs complete overlap cleanup. They cover:
 
 - single-file round trip
 - rerunning the same input into an existing output folder
