@@ -53,26 +53,30 @@ sds_obspy_cleanup_inplace.py  Post-process a standard SDS tree in place with
 
 mseed_availability_report.py  Build availability reports from MiniSEED/SDS.
                               This is a reporting tool, not a cleanup tool.
+                              Its normalized report uses ObsPy method=-1.
 
 yfile_availability_report.py  Build availability reports from raw Y-file input
                               using Nanometrics Y5DUMP headers.
 
 compare_mseed_outputs.py      Compare two MiniSEED/SDS trees at header,
-                              coverage, or sample level.
+                              coverage, or sample level. Deep comparison uses
+                              ObsPy Stream.merge(method=-1).
 
 compare_availability_lines.py Compare two generated availability text reports
                               line by line.
 
 run_full_availability_case.bat
-                              Local workflow for comparing yfile2miniseed with
-                              the national-center converter.
+                              Local lab workflow for comparing yfile2miniseed
+                              with another converter in one specific setup.
 
 availability_report_tools.md  Older Persian notes for the availability report
                               workflow.
 
-compare_mseed_outputs.md      Older Persian notes for comparing MiniSEED output
-                              trees.
+compare_mseed_outputs.md      Guide for comparing two arbitrary SDS archives.
 ```
+
+See [compare_mseed_outputs.md](compare_mseed_outputs.md) for comparison examples
+and report meanings.
 
 ## In-Place SDS Cleanup Details
 

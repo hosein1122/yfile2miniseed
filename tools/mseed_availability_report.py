@@ -244,7 +244,7 @@ def scan_mseed_normalized(args: argparse.Namespace) -> tuple[list[Segment], list
         try:
             normalized = stream.copy()
             normalized.sort()
-            normalized.merge(method=1, fill_value=None)
+            normalized.merge(method=-1)
         except Exception as exc:
             errors.append({"file": sid, "error": f"ObsPy merge failed: {exc!r}"})
             continue

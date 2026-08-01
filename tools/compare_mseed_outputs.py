@@ -5,10 +5,10 @@ Compare two MiniSEED/SDS output trees with ObsPy.
 Levels:
   simple  - headers only: ids, time span, rates, sample counts, file counts.
   medium  - headers only plus coverage/gap/overlap comparison.
-  deep    - reads sample data and compares merged traces.
+  deep    - reads sample data and compares ObsPy-cleaned traces.
 
-The reference tree is usually the national-center converter output. The
-candidate tree is usually yfile2miniseed output.
+Use this for any two SDS trees, for example an existing archive and a
+yfile2miniseed-generated archive after ObsPy cleanup.
 """
 
 from __future__ import annotations
@@ -103,7 +103,7 @@ def parse_args() -> argparse.Namespace:
         default="strict",
         help=(
             "strict compares full NET.STA.LOC.CHA. component compares NET.STA.LOC plus "
-            "the last channel letter, useful when one converter rewrites BHZ/SPZ to SHZ."
+            "the last channel letter, useful when two archives use different band codes."
         ),
     )
     parser.add_argument(
@@ -348,7 +348,7 @@ def load_stream_for_key(root: Path, key: str, args: argparse.Namespace) -> Strea
             if trace_key(trace.stats, args.id_mode, args.default_network) == key:
                 stream += trace
     stream.sort(keys=["starttime"])
-    stream.merge(method=1, fill_value=None)
+    stream.merge(method=-1)
     return stream
 
 
@@ -465,6 +465,7 @@ def main() -> int:
         "candidate": str(args.candidate),
         "level": args.level,
         "id_mode": args.id_mode,
+        "deep_merge_method": -1 if args.level == "deep" else None,
         "reference_file_errors": ref_errors,
         "candidate_file_errors": cand_errors,
         "reference_trace_count": len(ref_headers),

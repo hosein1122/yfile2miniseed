@@ -67,6 +67,7 @@ jobs:
           Copy-Item $lib.FullName $packageRoot
           Copy-Item "include" "$packageRoot\include" -Recurse
           Copy-Item "tools" "$packageRoot\tools" -Recurse
+          Copy-Item "docs" "$packageRoot\docs" -Recurse
           Copy-Item "README.md" $packageRoot
           Copy-Item "LICENSE" $packageRoot
           Compress-Archive -Path "$packageRoot\*" -DestinationPath "$env:DIST_DIR\$env:PACKAGE_NAME.zip" -Force
