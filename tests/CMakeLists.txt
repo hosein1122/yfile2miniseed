@@ -14,6 +14,20 @@ add_test(
     COMMAND yfile2miniseed_compute_tests
 )
 
+add_executable(yfile2miniseed_libmseed_workflow_tests
+    libmseed_workflow_tests.cpp
+)
+
+target_link_libraries(yfile2miniseed_libmseed_workflow_tests
+    PRIVATE
+        yfile2miniseed_lib
+)
+
+add_test(
+    NAME libmseed_workflow
+    COMMAND yfile2miniseed_libmseed_workflow_tests
+)
+
 if(Python3_Interpreter_FOUND)
     add_test(
         NAME obspy_steim1_cli
@@ -34,6 +48,17 @@ if(Python3_Interpreter_FOUND)
             ${CMAKE_CURRENT_SOURCE_DIR}/../tools/compare_mseed_outputs.py
     )
     set_tests_properties(compare_mseed_outputs PROPERTIES
+        SKIP_RETURN_CODE 77
+    )
+
+    add_test(
+        NAME compare_sds_archives
+        COMMAND
+            ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/compare_sds_archives_test.py
+            ${CMAKE_CURRENT_SOURCE_DIR}/../tools/compare_sds_archives.py
+    )
+    set_tests_properties(compare_sds_archives PROPERTIES
         SKIP_RETURN_CODE 77
     )
 endif()

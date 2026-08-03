@@ -32,16 +32,13 @@ static bool DoWriteMemoryToDisk(
 	const std::string& outputDir,
 	size_t& TotalRAMSampleNum
 ) {
+	(void)outputDir;
 
-	bool anyNewFileWritten = false;
-
-	if (!processor.TraceList_Export_MSeed(outputDir, anyNewFileWritten, miniSeedVersion3))
+	if (!processor.ClosePendingWriters())
 	{
-		spdlog::error("MiniSEED write failed. Keeping in-memory data intact.");
+		spdlog::error("Pending MiniSEED writer flush failed.");
 		return false;
 	}
-
-	processor.ClearTraceList();
 
 	TotalRAMSampleNum = 0;
 	return true;
@@ -94,13 +91,17 @@ static bool ProcessCurrentY(
 	if (sid == "FDSN:___")
 		return false;
 
-	processor.AddNewData(
+	if (!processor.AppendYFileToPendingSession(
 		sid.c_str(),
 		reader.t7.samples,
 		(int64_t)reader.t5.NumSamples,
 		(int64_t)(reader.t5.StartTime * 1'000'000'000),
-		(double)reader.t3.SampleRate
-	);
+		(double)reader.t3.SampleRate,
+		miniSeedVersion3
+	))
+	{
+		return false;
+	}
 
 
 	//yfile2miniseed::cli::stats::debug = true;
@@ -256,6 +257,9 @@ int main(int argc, char* argv[])
 	yfile2miniseed::Y5FileReader reader;
 	yfile2miniseed::MSeedProcessor processor;
 
+	if (!processor.BeginPendingSession(outputDir))
+		return 1;
+
 	////-----------------------------------
 	////اجرای تست های گوناگون بر روی تابع ComputeOkSeg:
 	//processor.SimulationTestComputeOkSeg();
@@ -408,22 +412,17 @@ int main(int argc, char* argv[])
 				}
 
 				//if it is not Y-File test if it is miniseed ver 2 or 3
-				else if (processor.ReadMSeed(filePath, TotalRAMSampleNum))
+				else if (processor.AppendMSeedFileToPendingSession(filePath))
 				{
 					successCount++;
 
 					//We are NOT reading Y-File, So it will NOT add to Y_Files STATs
 					//yfile2miniseed::cli::stats::checkNewData(sid, { reader.t5.StartTime,reader.t5.EndTime }, reader.t3.SampleRate);
 
-					//TotalRAMSampleNum is updated inside the read function
-					if (TotalRAMSampleNum > ((size_t)minRamInt * 184'000'000))	//1GB ~ 184'000'000 count sample
+					if (!processor.ClosePendingWriters())
 					{
-						spdlog::info("RAM limit reached. Writing MiniSEED...");
-						if (!DoWriteMemoryToDisk(processor, outputDir, TotalRAMSampleNum))
-						{
-							errorFiles.push_back(filePath);
-							return 1;
-						}
+						errorFiles.push_back(filePath);
+						return 1;
 					}
 				}
 				else //it is not Y-File or miniseed
@@ -469,11 +468,15 @@ int main(int argc, char* argv[])
 	{
 		//processor.ShowDataAvailability();
 
-		spdlog::info("Last Writing MiniSEED...");
+		spdlog::info("Closing pending MiniSEED writers...");
 
 		if (!DoWriteMemoryToDisk(processor, outputDir, TotalRAMSampleNum))
 			return 1;
 	}
+
+	spdlog::info("Finalizing pending SDS session...");
+	if (!processor.FinalizePendingSession(miniSeedVersion3))
+		return 1;
 
 	//Save Y-File Data Availability beside executed file
 	yfile2miniseed::cli::stats::WriteStats();

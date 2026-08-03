@@ -40,9 +40,20 @@ def run_cli(cli, input_path, output_dir):
 
 
 def output_files(output_dir):
-    files = sorted(Path(output_dir).rglob("*.mseed"))
+    files = []
+    for path in Path(output_dir).rglob("*"):
+        if not path.is_file():
+            continue
+        if ".yfile2mseed-session" in path.parts:
+            continue
+        if path.name.endswith((".tmp", ".pending", ".building", ".backup", ".txt", ".json", ".csv")):
+            continue
+        files.append(path)
+    files = sorted(files)
     if not files:
         raise AssertionError("CLI did not write any MiniSEED files")
+    if any(file.suffix.lower() == ".mseed" for file in files):
+        raise AssertionError("SDS output filenames must not use .mseed suffix")
     return files
 
 

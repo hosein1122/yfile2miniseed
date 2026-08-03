@@ -1,6 +1,8 @@
 #pragma once
 
 #include <libmseed.h>
+#include <filesystem>
+#include <fstream>
 #include <memory>
 #include <string>
 #include <map>
@@ -97,12 +99,31 @@ namespace yfile2miniseed {
 		/// <summary>
 		/// ذخیره TraceList به فایل MiniSEED
 		/// </summary>
+		// Legacy SDS export path.
+		// Retained temporarily for regression comparison.
+		// Not used by the new CLI SDS workflow.
 		int64_t WriteMSeed(const std::string& outputFile, bool miniSeedVersion3 = true);
 
 
+		// Legacy SDS export path.
+		// Retained temporarily for regression comparison.
+		// Not used by the new CLI SDS workflow.
 		bool TraceList_Export_MSeed(const std::string& BasePath, bool& anyNewFileWritten, bool miniSeedVersion3 = true);
 
 		void ClearTraceList();
+
+		bool BeginPendingSession(const std::string& sdsRoot);
+		bool AppendYFileToPendingSession(
+			const char* sid,
+			const int32_t* data,
+			int64_t numsamples,
+			int64_t startTime,
+			double samprate,
+			bool miniSeedVersion3 = true);
+		bool AppendMSeedFileToPendingSession(const std::string& inputFile);
+		bool ClosePendingWriters();
+		bool FinalizePendingSession(bool miniSeedVersion3 = true);
+		const std::filesystem::path& PendingSessionPath() const { return pendingSessionPath; }
 
 		//test
 		bool PropertyTestComputeOkSeg();
@@ -120,6 +141,20 @@ namespace yfile2miniseed {
 		int reclen = 4096; /* Desired maximum record length */
 		uint8_t encoding = DE_STEIM2; /* Desired data encoding */
 
+		struct PendingWriter {
+			std::filesystem::path path;
+			std::ofstream stream;
+			uint64_t lastUsed = 0;
+		};
+
+		std::filesystem::path pendingSdsRoot;
+		std::filesystem::path pendingSessionPath;
+		std::string pendingSessionName;
+		std::map<std::string, std::filesystem::path> pendingFilesByFinal;
+		std::map<std::string, PendingWriter> pendingWriters;
+		uint64_t pendingWriterClock = 0;
+		size_t maxOpenPendingWriters = 64;
+
 
 
 
@@ -132,6 +167,9 @@ namespace yfile2miniseed {
 			double samprate
 		);
 
+		// Legacy SDS export path.
+		// Retained temporarily for regression comparison.
+		// Not used by the new CLI SDS workflow.
 		int64_t WriteDataRangeToMSeed(
 			const std::string& mseedFile,
 			const char* sid,
@@ -141,6 +179,12 @@ namespace yfile2miniseed {
 			bool miniSeedVersion3);
 
 		bool ReadMSeedTo(const std::string& inputFile, MS3TraceList*& outMstl);
+
+		bool ReadMSeedTo(
+			const std::string& inputFile,
+			MS3TraceList*& outMstl,
+			uint32_t flags,
+			const char* label);
 
 		bool RepackMSeedFileOnce(const std::string& mseedFile, bool miniSeedVersion3);
 
@@ -153,7 +197,32 @@ namespace yfile2miniseed {
 			const char sid[LM_SIDLEN],
 			const std::string& basePath);
 
+		static bool BuildStrictSDSPath(
+			std::filesystem::path& outPath,
+			nstime_t startDate,
+			const char sid[LM_SIDLEN],
+			const std::filesystem::path& basePath);
+
+		bool WritePendingRecord(const char* record, int reclen);
+		static void PendingRecordHandler(char* record, int reclen, void* handlerdata);
+		bool OpenPendingWriter(const std::filesystem::path& finalPath, PendingWriter*& writer);
+		std::filesystem::path PendingPathForFinal(const std::filesystem::path& finalPath) const;
+		bool ResolveStaleCommitState(const std::filesystem::path& finalPath) const;
+		bool CommitOnePendingFile(
+			const std::filesystem::path& finalPath,
+			const std::filesystem::path& pendingPath,
+			bool miniSeedVersion3);
+		bool ValidateMSeedFile(const std::filesystem::path& path) const;
+		bool WriteTraceListFile(
+			MS3TraceList* traceList,
+			const std::filesystem::path& path,
+			bool miniSeedVersion3);
+		void CleanupPendingSessionIfEmpty() const;
+
 		//const nstime_t dT = static_cast<nstime_t>(1e9 / samprate);  //Delta Sampling time in Nano Sec.
+		// Legacy SDS export path.
+		// Retained temporarily for regression comparison.
+		// Not used by the new CLI SDS workflow.
 		static void ComputeOkSeg(
 			const Range& oldData,
 			DataRange& newSeg,
@@ -165,11 +234,17 @@ namespace yfile2miniseed {
 			std::map<double, std::vector<Range>>& oldDataDic,
 			const char* sid);
 
+		// Legacy SDS export path.
+		// Retained temporarily for regression comparison.
+		// Not used by the new CLI SDS workflow.
 		void BuildSegDay(const MS3TraceSeg* seg,
 			nstime_t dayStart,
 			nstime_t dayEnd,
 			DataRange& segDay);
 
+		// Legacy SDS export path.
+		// Retained temporarily for regression comparison.
+		// Not used by the new CLI SDS workflow.
 		bool LoadOldMSeedIfExists(
 			const std::string& mseedPath,
 			const std::string& mseedFile,
@@ -177,6 +252,9 @@ namespace yfile2miniseed {
 			std::map<double, std::vector<Range>>& oldDataDic,
 			const char* sid);
 
+		// Legacy SDS export path.
+		// Retained temporarily for regression comparison.
+		// Not used by the new CLI SDS workflow.
 		bool AppendSegDayAvoidDuplicate(
 			MS3TraceList* out_mstl,
 			const char* sid,

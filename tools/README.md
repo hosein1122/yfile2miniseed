@@ -62,6 +62,9 @@ compare_mseed_outputs.py      Compare two MiniSEED/SDS trees at header,
                               coverage, or sample level. Deep comparison uses
                               ObsPy Stream.merge(method=-1).
 
+compare_sds_gaps.py           Save ordered gap/overlap lists for two SDS trees
+                              and compare the two lists using ObsPy get_gaps().
+
 compare_availability_lines.py Compare two generated availability text reports
                               line by line.
 
@@ -80,6 +83,36 @@ compare_mseed_outputs.md      Guide for comparing two arbitrary SDS archives.
 
 See [compare_mseed_outputs.md](compare_mseed_outputs.md) for comparison examples
 and report meanings.
+
+## Compare SDS Gaps
+
+Use `compare_sds_gaps.py` when you only want the gaps/overlaps in two SDS trees:
+
+```bat
+python tools\compare_sds_gaps.py ^
+  --sds-a D:\ReferenceSDS ^
+  --sds-b D:\OurSDS ^
+  --a-label reference ^
+  --b-label ours ^
+  --report D:\SDS_gap_compare
+```
+
+The tool reads MiniSEED headers with ObsPy, sorts traces by stream and time, and
+uses `Stream.get_gaps()`. It writes the full ordered gap/overlap list for each
+SDS tree, then writes only differences to the final comparison CSV:
+
+```text
+gaps_reference.csv
+gaps_ours.csv
+gap_comparison.csv
+report.json
+```
+
+`gap_comparison.csv` contains only gaps/overlaps that exist in one SDS tree but
+not the other. A gap is considered shared when stream id, gap/overlap kind, start
+boundary, and end boundary match within `--time-tolerance-ns`.
+
+Use `--station KAZ` or `--channel SPE` to limit the comparison.
 
 ## In-Place SDS Cleanup Details
 

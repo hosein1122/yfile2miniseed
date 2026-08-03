@@ -19,7 +19,8 @@ From a Visual Studio Developer Command Prompt:
 
 ```bat
 cd /d D:\C++Code\yfile2miniseed
-cmake -S . -B out\build\x64-Release -DCMAKE_BUILD_TYPE=Release
+if exist out\build\x64-Release rmdir /s /q out\build\x64-Release
+cmake -S . -B out\build\x64-Release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 cmake --build out\build\x64-Release --config Release
 out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_sid_scan.exe D:\inputYFiles -o CorrectSID.txt
 out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\inputYFiles -o D:\OutputStore -V2
@@ -97,13 +98,22 @@ debugger.
 
 ### Release Build
 
-Open a Visual Studio Developer Command Prompt and run:
+Open an `x64 Native Tools Command Prompt for Visual Studio` and run:
 
 ```bat
 cd /d D:\C++Code\yfile2miniseed
-cmake -S . -B out\build\x64-Release -DCMAKE_BUILD_TYPE=Release
+cmake -S . -B out\build\x64-Release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 cmake --build out\build\x64-Release --config Release
 ```
+
+Use the x64 prompt, not the x86 prompt. If MSVC reports that
+`...\VC\Tools\MSVC\...\lib\x86\libcpmt.lib` conflicts with target machine type
+`x64`, the command prompt environment is wrong or the build directory contains
+stale CMake cache data. Close the prompt, open the x64 Native Tools prompt,
+delete `out\build\x64-Release`, and configure again.
+
+`-DBUILD_TESTING=OFF` is recommended when you only need the converter
+executable. Without it, `cmake --build` also builds test executables.
 
 The Release executable will be here:
 

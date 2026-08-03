@@ -3,7 +3,9 @@
 
 #include <spdlog/spdlog.h>
 #include <libmseed.h>
+#include <chrono>
 #include <iostream>
+#include <fstream>
 #include <filesystem>
 #include <map>
 #include <vector>
@@ -14,8 +16,17 @@
 #include <cstdlib>
 #include <cstdint>
 #include <algorithm>
+#include <cstdio>
 
 namespace yfile2miniseed {
+
+	namespace {
+		struct PendingPackContext
+		{
+			MSeedProcessor* self = nullptr;
+			bool ok = true;
+		};
+	}
 
 	// constructor
 	MSeedProcessor::MSeedProcessor() {
@@ -190,6 +201,9 @@ namespace yfile2miniseed {
 		return true;
 	}
 
+	// Legacy SDS export path.
+	// Retained temporarily for regression comparison.
+	// Not used by the new CLI SDS workflow.
 	int64_t MSeedProcessor::WriteMSeed(const std::string& outputFile, bool miniSeedVersion3)
 	{
 		if (!mstl) {
@@ -249,6 +263,9 @@ namespace yfile2miniseed {
 
 
 
+	// Legacy SDS export path.
+	// Retained temporarily for regression comparison.
+	// Not used by the new CLI SDS workflow.
 	bool MSeedProcessor::TraceList_Export_MSeed(const std::string& BasePath, bool& anyNewFileWritten, bool miniSeedVersion3)
 	{
 		if (!mstl) return false;
@@ -391,10 +408,684 @@ namespace yfile2miniseed {
 		}
 	}
 
+	bool MSeedProcessor::BeginPendingSession(const std::string& sdsRoot)
+	{
+		namespace fs = std::filesystem;
+
+		try
+		{
+			pendingSdsRoot = fs::absolute(fs::path(sdsRoot));
+			const auto ticks = std::chrono::duration_cast<std::chrono::milliseconds>(
+				std::chrono::system_clock::now().time_since_epoch()).count();
+			pendingSessionName = "session-" + std::to_string(ticks);
+			pendingSessionPath = pendingSdsRoot / ".yfile2mseed-session" / pendingSessionName;
+			fs::create_directories(pendingSessionPath);
+			pendingFilesByFinal.clear();
+			pendingWriters.clear();
+			pendingWriterClock = 0;
+			return true;
+		}
+		catch (const std::exception& ex)
+		{
+			spdlog::error("BeginPendingSession failed: {}", ex.what());
+			return false;
+		}
+	}
+
+	bool MSeedProcessor::AppendYFileToPendingSession(
+		const char* sid,
+		const int32_t* data,
+		int64_t numsamples,
+		int64_t startTime,
+		double samprate,
+		bool miniSeedVersion3)
+	{
+		if (pendingSessionPath.empty())
+		{
+			spdlog::error("Pending session was not initialized");
+			return false;
+		}
+		if (!sid || !data || numsamples <= 0 || samprate <= 0.0)
+		{
+			spdlog::error("AppendYFileToPendingSession(): invalid parameters");
+			return false;
+		}
+
+		msr->datasamples = nullptr;
+		msr->numsamples = 0;
+		msr->samplecnt = 0;
+
+		strncpy_s(msr->sid, sizeof(msr->sid), sid, _TRUNCATE);
+		msr->reclen = reclen;
+		msr->pubversion = 1;
+		msr->samprate = samprate;
+		msr->encoding = encoding;
+		msr->sampletype = 'i';
+		msr->datasamples = const_cast<int32_t*>(data);
+		msr->numsamples = numsamples;
+		msr->samplecnt = numsamples;
+		msr->starttime = startTime;
+
+		PendingPackContext context{ this, true };
+
+		uint32_t flags = MSF_FLUSHDATA;
+		if (!miniSeedVersion3)
+			flags |= MSF_PACKVER2;
+
+		int64_t packedSamples = 0;
+		const int64_t packedRecords = msr3_pack(
+			msr,
+			&MSeedProcessor::PendingRecordHandler,
+			&context,
+			&packedSamples,
+			flags,
+			verbose);
+
+		msr->datasamples = nullptr;
+		msr->numsamples = 0;
+		msr->samplecnt = 0;
+
+		if (packedRecords < 0)
+		{
+			spdlog::error("msr3_pack() failed for SID '{}'", sid);
+			ClosePendingWriters();
+			return false;
+		}
+		if (!context.ok)
+		{
+			spdlog::error("Writing pending records failed for SID '{}'", sid);
+			ClosePendingWriters();
+			return false;
+		}
+		if (packedSamples != numsamples)
+		{
+			spdlog::error(
+				"Packed sample count mismatch for SID '{}': {} != {}",
+				sid,
+				packedSamples,
+				numsamples);
+			ClosePendingWriters();
+			return false;
+		}
+
+		return true;
+	}
+
+	bool MSeedProcessor::AppendMSeedFileToPendingSession(const std::string& inputFile)
+	{
+		if (pendingSessionPath.empty())
+		{
+			spdlog::error("Pending session was not initialized");
+			return false;
+		}
+
+		MS3FileParam* msfp = nullptr;
+		MS3Record* record = nullptr;
+		constexpr uint32_t flags = MSF_VALIDATECRC;
+		int retcode = MS_NOERROR;
+		bool ok = true;
+
+		while ((retcode = ms3_readmsr_r(&msfp, &record, inputFile.c_str(), flags, verbose)) == MS_NOERROR)
+		{
+			if (!record || !record->record || record->reclen <= 0)
+			{
+				spdlog::error("Invalid MiniSEED record while reading '{}'", inputFile);
+				ok = false;
+				break;
+			}
+			if (!WritePendingRecord(record->record, record->reclen))
+			{
+				ok = false;
+				break;
+			}
+		}
+
+		ms3_readmsr_r(&msfp, &record, nullptr, 0, 0);
+
+		if (retcode != MS_ENDOFFILE && retcode != MS_NOERROR)
+		{
+			spdlog::error("Cannot read MiniSEED '{}': {}", inputFile, ms_errorstr(retcode));
+			ok = false;
+		}
+
+		if (!ok)
+			ClosePendingWriters();
+
+		return ok;
+	}
+
+	bool MSeedProcessor::ClosePendingWriters()
+	{
+		bool ok = true;
+		for (auto& item : pendingWriters)
+		{
+			item.second.stream.flush();
+			if (!item.second.stream)
+			{
+				spdlog::error("Failed to flush pending file '{}'", item.second.path.string());
+				ok = false;
+			}
+			item.second.stream.close();
+			if (!item.second.stream)
+			{
+				spdlog::error("Failed to close pending file '{}'", item.second.path.string());
+				ok = false;
+			}
+		}
+		pendingWriters.clear();
+		return ok;
+	}
+
+	bool MSeedProcessor::FinalizePendingSession(bool miniSeedVersion3)
+	{
+		if (pendingSessionPath.empty())
+			return true;
+
+		if (!ClosePendingWriters())
+			return false;
+
+		for (const auto& item : pendingFilesByFinal)
+		{
+			const std::filesystem::path finalPath(item.first);
+			const std::filesystem::path& pendingPath = item.second;
+
+			if (!std::filesystem::exists(pendingPath))
+			{
+				spdlog::warn("Pending file not found, skipping '{}'", pendingPath.string());
+				continue;
+			}
+
+			if (!CommitOnePendingFile(finalPath, pendingPath, miniSeedVersion3))
+				return false;
+		}
+
+		CleanupPendingSessionIfEmpty();
+		return true;
+	}
+
 
 	// ====================
 	// Private functions
 	// ====================
+	bool MSeedProcessor::BuildStrictSDSPath(
+		std::filesystem::path& outPath,
+		nstime_t startDate,
+		const char sid[LM_SIDLEN],
+		const std::filesystem::path& basePath)
+	{
+		uint16_t year = 0;
+		uint16_t yday = 0;
+		uint8_t hour = 0;
+		uint8_t min = 0;
+		uint8_t sec = 0;
+		uint32_t nsec = 0;
+
+		char network[11]{};
+		char station[11]{};
+		char location[11]{};
+		char channel[31]{};
+
+		ms_nstime2time(startDate, &year, &yday, &hour, &min, &sec, &nsec);
+		if (year == 0 || yday == 0)
+			return false;
+
+		if (ms_sid2nslc_n(
+			sid,
+			network, sizeof(network),
+			station, sizeof(station),
+			location, sizeof(location),
+			channel, sizeof(channel)) != 0)
+		{
+			return false;
+		}
+
+		if (network[0] == '\0' || station[0] == '\0' || channel[0] == '\0')
+			return false;
+
+		std::filesystem::path path(basePath);
+		path /= std::to_string(year);
+		path /= network;
+		path /= station;
+		path /= std::string(channel) + ".D";
+
+		char fileName[256]{};
+		const int n = _snprintf_s(
+			fileName,
+			sizeof(fileName),
+			_TRUNCATE,
+			"%s.%s.%s.%s.D.%u.%03u",
+			network,
+			station,
+			location,
+			channel,
+			static_cast<unsigned>(year),
+			static_cast<unsigned>(yday));
+
+		if (n < 0 || static_cast<size_t>(n) >= sizeof(fileName))
+			return false;
+
+		outPath = path / fileName;
+		return true;
+	}
+
+	void MSeedProcessor::PendingRecordHandler(char* record, int recordLength, void* handlerdata)
+	{
+		auto* context = static_cast<PendingPackContext*>(handlerdata);
+		if (!context || !context->self || !context->ok)
+			return;
+
+		if (!context->self->WritePendingRecord(record, recordLength))
+			context->ok = false;
+	}
+
+	bool MSeedProcessor::WritePendingRecord(const char* record, int recordLength)
+	{
+		if (!record || recordLength <= 0)
+		{
+			spdlog::error("WritePendingRecord(): invalid record");
+			return false;
+		}
+
+		MS3Record* parsed = nullptr;
+		const int parseCode = msr3_parse(record, static_cast<uint64_t>(recordLength), &parsed, 0, verbose);
+		if (parseCode != MS_NOERROR || !parsed)
+		{
+			spdlog::error("msr3_parse() failed for generated record: {}", ms_errorstr(parseCode));
+			msr3_free(&parsed);
+			return false;
+		}
+
+		std::filesystem::path finalPath;
+		if (!BuildStrictSDSPath(finalPath, parsed->starttime, parsed->sid, pendingSdsRoot))
+		{
+			spdlog::error("Cannot build SDS path for SID '{}'", parsed->sid);
+			msr3_free(&parsed);
+			return false;
+		}
+		msr3_free(&parsed);
+
+		PendingWriter* writer = nullptr;
+		if (!OpenPendingWriter(finalPath, writer))
+			return false;
+
+		writer->stream.write(record, recordLength);
+		if (!writer->stream)
+		{
+			spdlog::error("Failed to write pending record to '{}'", writer->path.string());
+			return false;
+		}
+
+		return true;
+	}
+
+	bool MSeedProcessor::OpenPendingWriter(const std::filesystem::path& finalPath, PendingWriter*& writer)
+	{
+		const std::string key = finalPath.string();
+		auto found = pendingWriters.find(key);
+		if (found != pendingWriters.end())
+		{
+			found->second.lastUsed = ++pendingWriterClock;
+			writer = &found->second;
+			return true;
+		}
+
+		if (pendingWriters.size() >= maxOpenPendingWriters)
+		{
+			auto victim = std::min_element(
+				pendingWriters.begin(),
+				pendingWriters.end(),
+				[](const auto& lhs, const auto& rhs) {
+					return lhs.second.lastUsed < rhs.second.lastUsed;
+				});
+
+			if (victim != pendingWriters.end())
+			{
+				victim->second.stream.flush();
+				if (!victim->second.stream)
+				{
+					spdlog::error("Failed to flush LRU pending writer '{}'", victim->second.path.string());
+					return false;
+				}
+				victim->second.stream.close();
+				if (!victim->second.stream)
+				{
+					spdlog::error("Failed to close LRU pending writer '{}'", victim->second.path.string());
+					return false;
+				}
+				pendingWriters.erase(victim);
+			}
+		}
+
+		const std::filesystem::path pendingPath = PendingPathForFinal(finalPath);
+		try
+		{
+			std::filesystem::create_directories(pendingPath.parent_path());
+		}
+		catch (const std::exception& ex)
+		{
+			spdlog::error("Cannot create pending directory '{}': {}", pendingPath.parent_path().string(), ex.what());
+			return false;
+		}
+
+		PendingWriter newWriter;
+		newWriter.path = pendingPath;
+		newWriter.lastUsed = ++pendingWriterClock;
+		newWriter.stream.open(pendingPath, std::ios::binary | std::ios::app);
+		if (!newWriter.stream)
+		{
+			spdlog::error("Cannot open pending file '{}'", pendingPath.string());
+			return false;
+		}
+
+		pendingFilesByFinal[key] = pendingPath;
+		auto inserted = pendingWriters.emplace(key, std::move(newWriter));
+		writer = &inserted.first->second;
+		return true;
+	}
+
+	std::filesystem::path MSeedProcessor::PendingPathForFinal(const std::filesystem::path& finalPath) const
+	{
+		std::error_code ec;
+		std::filesystem::path relative = std::filesystem::relative(finalPath, pendingSdsRoot, ec);
+		if (ec)
+			relative = finalPath.filename();
+
+		std::filesystem::path pendingPath = pendingSessionPath / relative;
+		pendingPath.replace_filename(pendingPath.filename().string() + ".pending");
+		return pendingPath;
+	}
+
+	bool MSeedProcessor::ReadMSeedTo(
+		const std::string& inputFile,
+		MS3TraceList*& outMstl,
+		uint32_t flags,
+		const char* label)
+	{
+		if (inputFile.empty())
+		{
+			spdlog::error("{}: input filename is empty", label ? label : "ReadMSeedTo");
+			return false;
+		}
+
+		const int retcode = ms3_readtracelist(
+			&outMstl,
+			inputFile.c_str(),
+			nullptr,
+			0,
+			flags,
+			verbose);
+
+		if (retcode != MS_NOERROR)
+		{
+			spdlog::error("{}: cannot read '{}': {}", label ? label : "ReadMSeedTo", inputFile, ms_errorstr(retcode));
+			return false;
+		}
+
+		return true;
+	}
+
+	bool MSeedProcessor::WriteTraceListFile(
+		MS3TraceList* traceList,
+		const std::filesystem::path& path,
+		bool miniSeedVersion3)
+	{
+		if (!traceList)
+			return false;
+
+		try
+		{
+			std::filesystem::create_directories(path.parent_path());
+		}
+		catch (const std::exception& ex)
+		{
+			spdlog::error("Cannot create output directory '{}': {}", path.parent_path().string(), ex.what());
+			return false;
+		}
+
+		uint32_t flags = MSF_FLUSHDATA;
+		if (!miniSeedVersion3)
+			flags |= MSF_PACKVER2;
+
+		const int64_t records = mstl3_writemseed(
+			traceList,
+			path.string().c_str(),
+			1,
+			reclen,
+			encoding,
+			flags,
+			verbose);
+
+		if (records <= 0)
+		{
+			spdlog::error("mstl3_writemseed() failed for '{}' (records={})", path.string(), records);
+			return false;
+		}
+
+		return true;
+	}
+
+	bool MSeedProcessor::ValidateMSeedFile(const std::filesystem::path& path) const
+	{
+		MS3TraceList* validateList = nullptr;
+		constexpr uint32_t flags = MSF_VALIDATECRC | MSF_UNPACKDATA;
+		const int retcode = ms3_readtracelist(
+			&validateList,
+			path.string().c_str(),
+			nullptr,
+			0,
+			flags,
+			verbose);
+		mstl3_free(&validateList, 1);
+
+		if (retcode != MS_NOERROR)
+		{
+			spdlog::error("Validation failed for '{}': {}", path.string(), ms_errorstr(retcode));
+			return false;
+		}
+
+		return true;
+	}
+
+	bool MSeedProcessor::ResolveStaleCommitState(const std::filesystem::path& finalPath) const
+	{
+		namespace fs = std::filesystem;
+		const fs::path parent = finalPath.parent_path();
+		const std::string baseName = finalPath.filename().string();
+		std::vector<fs::path> backups;
+		std::vector<fs::path> buildings;
+
+		if (fs::exists(parent))
+		{
+			for (const auto& entry : fs::directory_iterator(parent))
+			{
+				if (!entry.is_regular_file())
+					continue;
+				const std::string name = entry.path().filename().string();
+				if (name.rfind(baseName + ".", 0) != 0)
+					continue;
+				if (name.size() >= 7 && name.substr(name.size() - 7) == ".backup")
+					backups.push_back(entry.path());
+				else if (name.size() >= 9 && name.substr(name.size() - 9) == ".building")
+					buildings.push_back(entry.path());
+			}
+		}
+
+		if (!backups.empty())
+		{
+			if (!fs::exists(finalPath) && backups.size() == 1 && buildings.empty())
+			{
+				std::error_code ec;
+				fs::rename(backups.front(), finalPath, ec);
+				if (ec)
+				{
+					spdlog::error("Cannot restore stale backup '{}' to '{}': {}", backups.front().string(), finalPath.string(), ec.message());
+					return false;
+				}
+				spdlog::warn("Restored stale backup '{}'", finalPath.string());
+				return true;
+			}
+
+			spdlog::error("Stale backup exists for '{}'. Resolve it before continuing.", finalPath.string());
+			return false;
+		}
+
+		if (!buildings.empty())
+		{
+			spdlog::error("Stale building file exists for '{}'. Resolve it before continuing.", finalPath.string());
+			return false;
+		}
+
+		return true;
+	}
+
+	bool MSeedProcessor::CommitOnePendingFile(
+		const std::filesystem::path& finalPath,
+		const std::filesystem::path& pendingPath,
+		bool miniSeedVersion3)
+	{
+		namespace fs = std::filesystem;
+
+		if (!ResolveStaleCommitState(finalPath))
+			return false;
+
+		const std::string workBase = finalPath.filename().string() + "." + pendingSessionName;
+		const fs::path sortedPath = finalPath.parent_path() / (workBase + ".sorted.tmp");
+		const fs::path buildingPath = finalPath.parent_path() / (workBase + ".building");
+		const fs::path backupPath = finalPath.parent_path() / (workBase + ".backup");
+
+		if (fs::exists(sortedPath) || fs::exists(buildingPath) || fs::exists(backupPath))
+		{
+			spdlog::error("Session work file already exists for '{}'", finalPath.string());
+			return false;
+		}
+
+		MS3TraceList* combined = nullptr;
+		constexpr uint32_t readFlags = MSF_VALIDATECRC | MSF_UNPACKDATA;
+		if (fs::exists(finalPath))
+		{
+			if (!ReadMSeedTo(finalPath.string(), combined, readFlags, "Read existing SDS"))
+			{
+				mstl3_free(&combined, 1);
+				return false;
+			}
+		}
+
+		if (!ReadMSeedTo(pendingPath.string(), combined, readFlags, "Read pending SDS"))
+		{
+			mstl3_free(&combined, 1);
+			return false;
+		}
+
+		if (!WriteTraceListFile(combined, sortedPath, miniSeedVersion3))
+		{
+			mstl3_free(&combined, 1);
+			return false;
+		}
+		mstl3_free(&combined, 1);
+
+		MS3TraceList* dedupList = nullptr;
+		constexpr uint32_t dedupReadFlags = MSF_VALIDATECRC | MSF_UNPACKDATA | MSF_SKIPADJACENTDUPLICATES;
+		if (!ReadMSeedTo(sortedPath.string(), dedupList, dedupReadFlags, "Read sorted SDS with adjacent duplicate skip"))
+		{
+			mstl3_free(&dedupList, 1);
+			return false;
+		}
+
+		if (!WriteTraceListFile(dedupList, buildingPath, miniSeedVersion3))
+		{
+			mstl3_free(&dedupList, 1);
+			return false;
+		}
+		mstl3_free(&dedupList, 1);
+
+		if (!ValidateMSeedFile(buildingPath))
+			return false;
+
+		try
+		{
+			fs::create_directories(finalPath.parent_path());
+		}
+		catch (const std::exception& ex)
+		{
+			spdlog::error("Cannot create final SDS directory '{}': {}", finalPath.parent_path().string(), ex.what());
+			return false;
+		}
+
+		std::error_code ec;
+		const bool hadOriginal = fs::exists(finalPath);
+		if (hadOriginal)
+		{
+			fs::rename(finalPath, backupPath, ec);
+			if (ec)
+			{
+				spdlog::error("Cannot move original '{}' to backup '{}': {}", finalPath.string(), backupPath.string(), ec.message());
+				return false;
+			}
+		}
+
+		fs::rename(buildingPath, finalPath, ec);
+		if (ec)
+		{
+			spdlog::error("Cannot move building '{}' to final '{}': {}", buildingPath.string(), finalPath.string(), ec.message());
+			if (hadOriginal)
+			{
+				std::error_code restoreEc;
+				fs::rename(backupPath, finalPath, restoreEc);
+				if (restoreEc)
+					spdlog::error("Cannot restore backup '{}': {}", backupPath.string(), restoreEc.message());
+			}
+			return false;
+		}
+
+		if (!ValidateMSeedFile(finalPath))
+		{
+			std::error_code removeEc;
+			fs::remove(finalPath, removeEc);
+			if (hadOriginal)
+			{
+				std::error_code restoreEc;
+				fs::rename(backupPath, finalPath, restoreEc);
+				if (restoreEc)
+					spdlog::error("Cannot restore backup '{}': {}", backupPath.string(), restoreEc.message());
+			}
+			return false;
+		}
+
+		if (hadOriginal)
+			fs::remove(backupPath, ec);
+		fs::remove(pendingPath, ec);
+		fs::remove(sortedPath, ec);
+
+		return true;
+	}
+
+	void MSeedProcessor::CleanupPendingSessionIfEmpty() const
+	{
+		if (pendingSessionPath.empty())
+			return;
+
+		std::error_code ec;
+		std::filesystem::remove_all(pendingSessionPath, ec);
+		if (ec)
+		{
+			spdlog::warn("Cannot remove pending session '{}': {}", pendingSessionPath.string(), ec.message());
+			return;
+		}
+
+		const auto sessionsRoot = pendingSessionPath.parent_path();
+		if (sessionsRoot.empty())
+			return;
+
+		ec.clear();
+		if (std::filesystem::exists(sessionsRoot, ec) && std::filesystem::is_empty(sessionsRoot, ec))
+		{
+			ec.clear();
+			std::filesystem::remove(sessionsRoot, ec);
+			if (ec)
+				spdlog::warn("Cannot remove pending sessions root '{}': {}", sessionsRoot.string(), ec.message());
+		}
+	}
+
 	void MSeedProcessor::AddNewDataTo(
 		MS3TraceList* out_mstl,
 		const char* sid,
@@ -445,6 +1136,9 @@ namespace yfile2miniseed {
 		msr->samplecnt = 0;
 	}
 
+	// Legacy SDS export path.
+	// Retained temporarily for regression comparison.
+	// Not used by the new CLI SDS workflow.
 	int64_t MSeedProcessor::WriteDataRangeToMSeed(
 		const std::string& mseedFile,
 		const char* sid,
@@ -547,34 +1241,12 @@ namespace yfile2miniseed {
 
 	bool MSeedProcessor::ReadMSeedTo(const std::string& inputFile, MS3TraceList*& outMstl)
 	{
-		if (inputFile.empty())
-		{
-			spdlog::error("ReadMSeed(): input filename is empty");
-			return false;
-		}
-
 		constexpr uint32_t flags =
 			MSF_VALIDATECRC |
 			MSF_UNPACKDATA |
 			MSF_SKIPADJACENTDUPLICATES;
 
-		int retcode = ms3_readtracelist(
-			&outMstl,
-			inputFile.c_str(),
-			nullptr,
-			0,
-			flags,
-			verbose
-		);
-
-		if (retcode != MS_NOERROR) {
-			spdlog::error("Cannot read {}: {}", inputFile, ms_errorstr(retcode));
-			return false;
-		}
-
-		spdlog::info("Successfully read MiniSEED file '{}'", inputFile);
-
-		return true;
+		return ReadMSeedTo(inputFile, outMstl, flags, "ReadMSeedTo");
 	}
 
 	bool MSeedProcessor::RepackMSeedFileOnce(const std::string& mseedFile, bool miniSeedVersion3)
@@ -735,6 +1407,9 @@ namespace yfile2miniseed {
 	}
 
 	//const nstime_t dT = static_cast<nstime_t>(1e9 / samprate);  //Delta Sampling time in Nano Sec.
+	// Legacy SDS export path.
+	// Retained temporarily for regression comparison.
+	// Not used by the new CLI SDS workflow.
 	void MSeedProcessor::ComputeOkSeg(
 		const Range& oldData,
 		DataRange& newSeg,
@@ -917,6 +1592,9 @@ namespace yfile2miniseed {
 		}
 	}
 
+	// Legacy SDS export path.
+	// Retained temporarily for regression comparison.
+	// Not used by the new CLI SDS workflow.
 	void MSeedProcessor::BuildSegDay(const MS3TraceSeg* seg,
 		nstime_t dayStart,
 		nstime_t dayEnd,
@@ -1089,6 +1767,9 @@ namespace yfile2miniseed {
 	}
 
 
+	// Legacy SDS export path.
+	// Retained temporarily for regression comparison.
+	// Not used by the new CLI SDS workflow.
 	bool MSeedProcessor::LoadOldMSeedIfExists(
 		const std::string& mseedPath,
 		const std::string& mseedFile,
@@ -1140,6 +1821,9 @@ namespace yfile2miniseed {
 	}
 
 
+	// Legacy SDS export path.
+	// Retained temporarily for regression comparison.
+	// Not used by the new CLI SDS workflow.
 	bool MSeedProcessor::AppendSegDayAvoidDuplicate(
 		MS3TraceList* out_mstl,
 		const char* sid,
