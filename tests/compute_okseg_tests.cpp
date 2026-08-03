@@ -18,5 +18,11 @@ int main()
 		return 1;
 	}
 
+	if (!processor.TestBuildSegDayMidnightSplit())
+	{
+		std::cerr << "TestBuildSegDayMidnightSplit failed\n";
+		return 1;
+	}
+
 	return 0;
 }

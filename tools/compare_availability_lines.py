@@ -14,6 +14,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--center", required=True, type=Path, help="Center/reference availability text file.")
     parser.add_argument("--ours", required=True, type=Path, help="Our/candidate availability text file.")
     parser.add_argument("--output", required=True, type=Path, help="Output difference text file.")
+    parser.add_argument("--center-label", default="CENTER", help="Label to print for the first report.")
+    parser.add_argument("--ours-label", default="OUR", help="Label to print for the second report.")
     return parser.parse_args()
 
 
@@ -37,8 +39,8 @@ def main() -> int:
     diff_count = 0
     out_lines = [
         "Availability Line Differences",
-        f"Center file: {args.center}",
-        f"Our file   : {args.ours}",
+        f"{args.center_label} file: {args.center}",
+        f"{args.ours_label} file: {args.ours}",
         "",
     ]
 
@@ -52,8 +54,8 @@ def main() -> int:
         out_lines.extend(
             [
                 f"Line {line_number}",
-                f"CENTER: {center_line}",
-                f"OUR   : {our_line}",
+                f"{args.center_label}: {center_line}",
+                f"{args.ours_label}: {our_line}",
                 "",
             ]
         )

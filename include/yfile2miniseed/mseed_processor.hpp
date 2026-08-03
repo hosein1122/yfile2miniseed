@@ -107,6 +107,7 @@ namespace yfile2miniseed {
 		//test
 		bool PropertyTestComputeOkSeg();
 		bool SimulationTestComputeOkSeg();
+		bool TestBuildSegDayMidnightSplit();
 		void TestComputeOkSeg();
 		void Test2();
 
@@ -130,6 +131,14 @@ namespace yfile2miniseed {
 			const int32_t* data, int64_t numsamples, int64_t startTime,
 			double samprate
 		);
+
+		int64_t WriteDataRangeToMSeed(
+			const std::string& mseedFile,
+			const char* sid,
+			const DataRange& segDay,
+			double samprate,
+			bool overwrite,
+			bool miniSeedVersion3);
 
 		bool ReadMSeedTo(const std::string& inputFile, MS3TraceList*& outMstl);
 

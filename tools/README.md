@@ -69,6 +69,9 @@ run_full_availability_case.bat
                               Local lab workflow for comparing yfile2miniseed
                               with another converter in one specific setup.
 
+compare_sds_availability.bat  Build availability reports for two existing SDS
+                              folders and compare the reports line by line.
+
 availability_report_tools.md  Older Persian notes for the availability report
                               workflow.
 

@@ -256,15 +256,25 @@ namespace yfile2miniseed {
 		anyNewFileWritten = false;
 		const nstime_t DAY_NS = 86400000000000LL; // نانوثانیه در یک روز
 
-		uint32_t flags = MSF_FLUSHDATA;	//[Packing] Pack all available data even if final record would not be filled
 
 		// پیمایش Traceها
 		for (MS3TraceID* tid = mstl->traces.next[0]; tid; tid = tid->next[0])
 		{
 			spdlog::info("Processing SID: '{}'", tid->sid);
 
-			nstime_t startDayNS = (tid->earliest / DAY_NS) * DAY_NS;
-			nstime_t endDayNS = (tid->latest / DAY_NS) * DAY_NS;
+			nstime_t maxHalfSampleNS = 0;
+			for (MS3TraceSeg* seg = tid->first; seg != nullptr; seg = seg->next)
+			{
+				if (seg->samprate > 0.0)
+				{
+					nstime_t dT = (nstime_t)(NSTMODULUS / seg->samprate + 0.5);
+					if ((dT / 2) > maxHalfSampleNS)
+						maxHalfSampleNS = dT / 2;
+				}
+			}
+
+			nstime_t startDayNS = ((tid->earliest - maxHalfSampleNS) / DAY_NS) * DAY_NS;
+			nstime_t endDayNS = ((tid->latest + maxHalfSampleNS) / DAY_NS) * DAY_NS;
 
 			// بهینه‌سازی: نگه داشتن آخرین سگمنت بررسی شده برای شروع سریع‌تر در روز بعد
 			MS3TraceSeg* startSegForDay = tid->first;
@@ -273,9 +283,8 @@ namespace yfile2miniseed {
 			{
 				nstime_t nextDay = currentDay + DAY_NS;
 
-				std::map<double, std::vector<Range>> oldDataDic;	//for (currentDay)
-				MS3TraceList* out_mstl = nullptr;
 				bool recordAddedForThisDay = false;
+				int64_t packedrecordsForThisDay = 0;
 
 				std::string mseedPath, mseedFile;
 				GetDirectoryAndFileName(mseedPath, mseedFile, currentDay, tid->sid, BasePath);
@@ -301,11 +310,11 @@ namespace yfile2miniseed {
 					}
 
 					// ۳. لود کردن فایل قدیمی (فقط یکبار در صورت نیاز)
-					if (out_mstl == nullptr)
+					if (!std::filesystem::exists(mseedPath))
 					{
-						if (!LoadOldMSeedIfExists(mseedPath, mseedFile, out_mstl, oldDataDic, tid->sid))
+						if (!CreateDirectoryIfNotExists(mseedPath))
 						{
-							spdlog::error("Failed to load/initialize MSeed for {}", mseedFile);
+							spdlog::error("Failed to create output directory '{}'", mseedPath);
 							return false;
 						}
 					}
@@ -315,17 +324,28 @@ namespace yfile2miniseed {
 					BuildSegDay(seg, currentDay, nextDay, segDay);
 					if (segDay.numsamples > 0)
 					{
-						// Decision 2026-08-01: do not use project-owned overlap or
-						// duplicate clipping here. Append the day slice as-is and
-						// rely on libmseed read/repack behavior plus later ObsPy cleanup.
-						AddNewDataTo(
-							out_mstl,
+						// Preserve overlapping input segments as distinct MiniSEED records.
+						// Packing through MS3TraceList treats data as one time series and
+						// can absorb a shared boundary sample into a neighboring segment.
+						int64_t packedrecords = WriteDataRangeToMSeed(
+							mseedFile,
 							tid->sid,
-							segDay.dataPtr,
-							segDay.numsamples,
-							segDay.start,
-							seg->samprate
+							segDay,
+							seg->samprate,
+							!recordAddedForThisDay,
+							miniSeedVersion3
 						);
+						if (packedrecords < 0)
+						{
+							spdlog::error(
+								"msr3_writemseed() failed for '{}' (code={})",
+								mseedFile,
+								packedrecords
+							);
+							return false;
+						}
+
+						packedrecordsForThisDay += packedrecords;
 						recordAddedForThisDay = true;
 					}
 
@@ -342,46 +362,17 @@ namespace yfile2miniseed {
 				// ذخیره‌سازی در صورت تغییر
 				if (recordAddedForThisDay)
 				{
-					if (!miniSeedVersion3)		//if version 2 is selected so the flag shuld be updated here!!
-						flags |= MSF_PACKVER2;	//pack as miniseed version 2
-
-					int64_t packedrecords = mstl3_writemseed(out_mstl, mseedFile.c_str(), 1,
-						this->reclen, this->encoding, flags, this->verbose);
-
-					if (packedrecords < 0)
-					{
-						spdlog::error(
-							"mstl3_writemseed() failed for '{}' (code={})",
-							mseedFile,
-							packedrecords
-						);
-						if (out_mstl)
-							mstl3_free(&out_mstl, 1);
-						return false;
-					}
-
-					if (packedrecords == 0)
+					if (packedrecordsForThisDay == 0)
 					{
 						spdlog::warn("No MiniSEED records written to '{}'", mseedFile);
 					}
 					else
 					{
-						spdlog::info("Wrote {} records to '{}'", packedrecords, mseedFile);
-						if (!RepackMSeedFileOnce(mseedFile, miniSeedVersion3))
-						{
-							if (out_mstl)
-								mstl3_free(&out_mstl, 1);
-							return false;
-						}
+						spdlog::info("Wrote {} records to '{}'", packedrecordsForThisDay, mseedFile);
 						anyNewFileWritten = true;
 					}
 				}
 
-				if (out_mstl)
-				{
-					// mstl3_printtracelist(out_mstl, ISOMONTHDAY, 1, 1, 0); // برای دیباگ
-					mstl3_free(&out_mstl, 1);
-				}
 
 			}
 		}
@@ -444,7 +435,7 @@ namespace yfile2miniseed {
 		msr->starttime = startTime;
 
 		//if (mstl3_addmsr_recordptr(Outmstl, msr, &recordptr, 0, 1, flags, NULL) == NULL)
-		if (!mstl3_addmsr(out_mstl, msr, 0, 1, flags, NULL))
+		if (!mstl3_addmsr(out_mstl, msr, 0, 0, flags, NULL))
 		{
 			spdlog::error("mstl3_addmsr() failed for SID: {}", sid);
 		}
@@ -452,6 +443,52 @@ namespace yfile2miniseed {
 		msr->datasamples = nullptr;
 		msr->numsamples = 0;
 		msr->samplecnt = 0;
+	}
+
+	int64_t MSeedProcessor::WriteDataRangeToMSeed(
+		const std::string& mseedFile,
+		const char* sid,
+		const DataRange& segDay,
+		double samprate,
+		bool overwrite,
+		bool miniSeedVersion3)
+	{
+		if (!sid || !segDay.dataPtr || segDay.numsamples <= 0 || samprate <= 0.0) {
+			spdlog::error("WriteDataRangeToMSeed(): invalid parameters");
+			return -1;
+		}
+
+		uint32_t flags = MSF_FLUSHDATA;
+		if (!miniSeedVersion3)
+			flags |= MSF_PACKVER2;
+
+		msr->datasamples = nullptr;
+		msr->numsamples = 0;
+		msr->samplecnt = 0;
+
+		strncpy_s(msr->sid, sizeof(msr->sid), sid, _TRUNCATE);
+		msr->reclen = reclen;
+		msr->pubversion = 1;
+		msr->samprate = samprate;
+		msr->encoding = encoding;
+		msr->sampletype = 'i';
+		msr->datasamples = segDay.dataPtr;
+		msr->numsamples = segDay.numsamples;
+		msr->samplecnt = segDay.numsamples;
+		msr->starttime = segDay.start;
+
+		int64_t packedrecords = msr3_writemseed(
+			msr,
+			mseedFile.c_str(),
+			overwrite ? 1 : 0,
+			flags,
+			this->verbose);
+
+		msr->datasamples = nullptr;
+		msr->numsamples = 0;
+		msr->samplecnt = 0;
+
+		return packedrecords;
 	}
 
 
@@ -891,32 +928,70 @@ namespace yfile2miniseed {
 			return;
 		}
 
-		// Quick reject: no overlap
-		if (seg->endtime < dayStart || seg->starttime >= dayEnd) {
+		long double sr = seg->samprate;
+		nstime_t dT = (nstime_t)(NSTMODULUS / sr + 0.5);
+		if (dT <= 0) {
+			spdlog::error("BuildSegDay: invalid sample interval {}", dT);
+			return;
+		}
+		nstime_t halfSample = dT / 2;
+		nstime_t effectiveDayStart = dayStart + halfSample;
+		nstime_t effectiveDayEnd = dayEnd + halfSample;
+
+		// Samples are assigned to the day whose boundary they are closest to.
+		if (seg->endtime < effectiveDayStart || seg->starttime >= effectiveDayEnd) {
 			return;
 		}
 
-		long double sr = seg->samprate;
-		nstime_t dT = (nstime_t)(NSTMODULUS / sr + 0.5);
-		nstime_t nstimetol = dT / 2;
+		auto ceilDivPositive = [](nstime_t numerator, nstime_t denominator) -> int64_t {
+			if (numerator <= 0) {
+				return 0;
+			}
+			return static_cast<int64_t>(1 + ((numerator - 1) / denominator));
+		};
+		auto exactSampleIndex = [&](nstime_t sampleTime, int64_t& index) -> bool {
+			nstime_t diff = sampleTime - seg->starttime;
+			if (diff < 0 || diff % dT != 0) {
+				return false;
+			}
+
+			index = diff / dT;
+			return index >= 0 && index < seg->numsamples;
+		};
 
 		int64_t idxStart = 0;
 		int64_t idxEnd = seg->numsamples - 1;
 
 		// Clip start index by day start
-		if (seg->starttime < dayStart)
+		if (seg->starttime < effectiveDayStart)
 		{
-			//idxStart = (int64_t)((dayStart - seg->starttime + nstimetol) / dT);
-			nstime_t diff = dayStart - seg->starttime;
-			idxStart = (int64_t)((diff + nstimetol) / dT);
+			int64_t exactBoundaryIndex = 0;
+			if (exactSampleIndex(dayStart, exactBoundaryIndex))
+			{
+				idxStart = exactBoundaryIndex;
+			}
+			else
+			{
+				nstime_t diff = effectiveDayStart - seg->starttime;
+				idxStart = ceilDivPositive(diff, dT);
+			}
 		}
 
 		// Clip end index by day end
-		if (seg->endtime >= dayEnd)
+		int64_t exactBoundaryIndex = 0;
+		if (exactSampleIndex(dayEnd, exactBoundaryIndex))
 		{
-			//idxEnd = (int64_t)(((dayEnd - dT) - seg->starttime + nstimetol) / dT);
-			nstime_t diff = (dayEnd - dT) - seg->starttime;
-			idxEnd = (int64_t)((diff + nstimetol) / dT);
+			idxEnd = exactBoundaryIndex - 1;
+		}
+		else if (seg->endtime >= effectiveDayEnd)
+		{
+			nstime_t diff = effectiveDayEnd - seg->starttime;
+			idxEnd = ceilDivPositive(diff, dT) - 1;
+		}
+
+		if (idxStart >= seg->numsamples || idxEnd < 0 || idxEnd < idxStart)
+		{
+			return;
 		}
 
 		if (idxStart < 0 || idxStart >= seg->numsamples ||
@@ -937,6 +1012,80 @@ namespace yfile2miniseed {
 		segDay.numsamples = idxEnd - idxStart + 1;
 
 		return;
+	}
+
+	bool MSeedProcessor::TestBuildSegDayMidnightSplit()
+	{
+		const nstime_t DAY_NS = 86400000000000LL;
+		const nstime_t dT = 20000000LL;
+		const int64_t midnightPreviousIndex = 153703;
+		const int64_t numsamples = 154650;
+
+		// Sample 153703 is 8.9 ms before midnight; sample 153704 is 11.1 ms after it.
+		const nstime_t segStart = DAY_NS - (midnightPreviousIndex * dT) - 8900000LL;
+		std::vector<int32_t> data(static_cast<size_t>(numsamples), 0);
+
+		MS3TraceSeg seg{};
+		seg.starttime = segStart;
+		seg.endtime = segStart + ((numsamples - 1) * dT);
+		seg.samprate = 50.0;
+		seg.numsamples = numsamples;
+		seg.datasamples = data.data();
+
+		DataRange firstDay{};
+		BuildSegDay(&seg, 0, DAY_NS, firstDay);
+		if (firstDay.numsamples != midnightPreviousIndex + 1 ||
+			firstDay.dataPtr != data.data() ||
+			firstDay.start != segStart ||
+			firstDay.end != DAY_NS - 8900000LL)
+		{
+			return false;
+		}
+
+		DataRange secondDay{};
+		BuildSegDay(&seg, DAY_NS, 2 * DAY_NS, secondDay);
+		if (secondDay.numsamples != numsamples - midnightPreviousIndex - 1 ||
+			secondDay.dataPtr != data.data() + midnightPreviousIndex + 1 ||
+			secondDay.start != DAY_NS + 11100000LL ||
+			secondDay.end != seg.endtime)
+		{
+			return false;
+		}
+
+		const int64_t midnightNextIndex = 2307;
+		const int64_t shortSamples = 2310;
+		const nstime_t afterMidnightSample = DAY_NS + 3375000LL;
+		const nstime_t shortSegStart = afterMidnightSample - (midnightNextIndex * dT);
+		std::vector<int32_t> shortData(static_cast<size_t>(shortSamples), 0);
+
+		MS3TraceSeg shortSeg{};
+		shortSeg.starttime = shortSegStart;
+		shortSeg.endtime = shortSegStart + ((shortSamples - 1) * dT);
+		shortSeg.samprate = 50.0;
+		shortSeg.numsamples = shortSamples;
+		shortSeg.datasamples = shortData.data();
+
+		DataRange previousDay{};
+		BuildSegDay(&shortSeg, 0, DAY_NS, previousDay);
+		if (previousDay.numsamples != midnightNextIndex + 1 ||
+			previousDay.dataPtr != shortData.data() ||
+			previousDay.start != shortSegStart ||
+			previousDay.end != afterMidnightSample)
+		{
+			return false;
+		}
+
+		DataRange nextDay{};
+		BuildSegDay(&shortSeg, DAY_NS, 2 * DAY_NS, nextDay);
+		if (nextDay.numsamples != shortSamples - midnightNextIndex - 1 ||
+			nextDay.dataPtr != shortData.data() + midnightNextIndex + 1 ||
+			nextDay.start != afterMidnightSample + dT ||
+			nextDay.end != shortSeg.endtime)
+		{
+			return false;
+		}
+
+		return true;
 	}
 
 
