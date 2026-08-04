@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Build a strict SDS archive from Nanometrics Y-files with ObsPy."""
+"""Build a record-routed strict SDS archive from Nanometrics Y-files with ObsPy."""
 
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -14,6 +16,7 @@ import numpy as np
 import obspy
 from obspy import Stream, Trace, UTCDateTime, read
 from obspy.clients.filesystem.sds import SDS_FMTSTR
+from obspy.io.mseed.util import get_record_information
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -178,20 +181,68 @@ def day_start(time_: UTCDateTime) -> UTCDateTime:
     return UTCDateTime(time_.year, time_.month, time_.day, precision=9)
 
 
-def daily_parts(trace: Trace):
-    current_day = day_start(trace.stats.starttime)
-    end_time = trace.stats.endtime
+def pack_trace_records(
+    trace: Trace,
+    args: argparse.Namespace,
+    temp_dir: Path,
+    trace_index: int,
+):
+    """
+    Pack one complete Trace first, then yield its raw fixed-length MiniSEED
+    records. This preserves natural MiniSEED record boundaries and avoids
+    creating artificial Trace breaks exactly at midnight.
+    """
+    temp_path = temp_dir / f"trace_{trace_index:08d}.mseed"
+    Stream([trace]).write(
+        str(temp_path),
+        format="MSEED",
+        encoding=args.encoding,
+        reclen=args.record_length,
+        flush=True,
+    )
 
-    while current_day <= end_time:
-        next_day = current_day + 86400
-        part = trace.slice(
-            max(trace.stats.starttime, current_day),
-            min(end_time, next_day - 0.000000001),
-            nearest_sample=False,
-        ).copy()
-        if part.stats.npts:
-            yield current_day, part
-        current_day = next_day
+    file_size = temp_path.stat().st_size
+    if file_size == 0:
+        raise RuntimeError(f"ObsPy wrote an empty MiniSEED file for {trace.id}")
+    if file_size % args.record_length != 0:
+        raise RuntimeError(
+            f"packed MiniSEED size is not divisible by record length for {trace.id}: "
+            f"size={file_size}, reclen={args.record_length}"
+        )
+
+    try:
+        with temp_path.open("rb") as handle:
+            record_index = 0
+            while True:
+                record = handle.read(args.record_length)
+                if not record:
+                    break
+                record_index += 1
+                if len(record) != args.record_length:
+                    raise RuntimeError(
+                        f"short MiniSEED record for {trace.id}: "
+                        f"record={record_index}, bytes={len(record)}"
+                    )
+
+                info = get_record_information(io.BytesIO(record))
+                actual_length = int(info.get("record_length", args.record_length))
+                if actual_length != args.record_length:
+                    raise RuntimeError(
+                        f"unexpected MiniSEED record length for {trace.id}: "
+                        f"record={record_index}, expected={args.record_length}, "
+                        f"actual={actual_length}"
+                    )
+
+                record_start = info.get("starttime")
+                if record_start is None:
+                    raise RuntimeError(
+                        f"MiniSEED record start time is missing for {trace.id}: "
+                        f"record={record_index}"
+                    )
+
+                yield record_start, record
+    finally:
+        temp_path.unlink(missing_ok=True)
 
 
 def sds_path(root: Path, trace: Trace, day: UTCDateTime) -> Path:
@@ -245,26 +296,53 @@ def main() -> int:
     stream.merge(method=-1)
     stream.sort(keys=["network", "station", "location", "channel", "starttime", "endtime"])
 
-    destinations: dict[Path, list[Trace]] = defaultdict(list)
-    for trace in stream:
-        for day, part in daily_parts(trace):
-            destinations[sds_path(output_root, part, day)].append(part)
+    record_counts: dict[Path, int] = defaultdict(int)
+    output_handles = {}
+    total_records = 0
+    total_samples = sum(int(trace.stats.npts) for trace in stream)
 
-    total_samples = 0
-    for index, path in enumerate(sorted(destinations), start=1):
-        daily_stream = Stream(destinations[path])
-        daily_stream.sort(keys=["network", "station", "location", "channel", "starttime", "endtime"])
-        path.parent.mkdir(parents=True, exist_ok=True)
-        daily_stream.write(
-            str(path),
-            format="MSEED",
-            encoding=args.encoding,
-            reclen=args.record_length,
-            flush=True,
+    try:
+        with tempfile.TemporaryDirectory(prefix="yfile_reference_pack_") as temp:
+            temp_dir = Path(temp)
+            for trace_index, trace in enumerate(stream, start=1):
+                trace_record_count = 0
+                for record_start, record in pack_trace_records(
+                    trace,
+                    args,
+                    temp_dir,
+                    trace_index,
+                ):
+                    day = day_start(record_start)
+                    path = sds_path(output_root, trace, day)
+                    if path not in output_handles:
+                        path.parent.mkdir(parents=True, exist_ok=True)
+                        output_handles[path] = path.open("ab")
+
+                    output_handles[path].write(record)
+                    record_counts[path] += 1
+                    total_records += 1
+                    trace_record_count += 1
+
+                print(
+                    f"[{trace_index}/{len(stream)}] packed {trace.id} "
+                    f"records={trace_record_count} samples={trace.stats.npts}"
+                )
+    finally:
+        for handle in output_handles.values():
+            handle.close()
+
+    for index, path in enumerate(sorted(record_counts), start=1):
+        expected_size = record_counts[path] * args.record_length
+        actual_size = path.stat().st_size
+        if actual_size != expected_size:
+            raise RuntimeError(
+                f"SDS file size mismatch: {path}: "
+                f"expected={expected_size}, actual={actual_size}"
+            )
+        print(
+            f"[{index}/{len(record_counts)}] wrote {path} "
+            f"records={record_counts[path]} bytes={actual_size}"
         )
-        samples = sum(int(trace.stats.npts) for trace in daily_stream)
-        total_samples += samples
-        print(f"[{index}/{len(destinations)}] wrote {path} traces={len(daily_stream)} samples={samples}")
 
     report = {
         "input_root": str(input_root),
@@ -272,7 +350,8 @@ def main() -> int:
         "obspy": obspy.__version__,
         "numpy": np.__version__,
         "files_read": len(files),
-        "sds_files_written": len(destinations),
+        "sds_files_written": len(record_counts),
+        "records_written": total_records,
         "samples_written": total_samples,
         "encoding": args.encoding,
         "record_length": args.record_length,

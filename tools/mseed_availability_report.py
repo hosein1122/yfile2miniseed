@@ -10,7 +10,6 @@ side by side.
 from __future__ import annotations
 
 import argparse
-import csv
 import sys
 from collections import defaultdict
 from dataclasses import dataclass
@@ -24,6 +23,8 @@ except Exception as exc:
     print(f"ObsPy/Numpy import failed: {exc}", file=sys.stderr)
     sys.exit(2)
 
+
+SCRIPT_VERSION = "2026-08-04-no-empty-error-files-v2"
 
 SKIP_SUFFIXES = {
     ".bat",
@@ -77,7 +78,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--write-normalized",
         action="store_true",
-        help="Also write an ObsPy-normalized report under <output>/normalized.",
+        help=(
+            "Also write ObsPy-normalized reports beside the original reports "
+            "as availability_normalized.txt and errors_normalized.txt."
+        ),
     )
     parser.add_argument(
         "--snap-times",
@@ -271,13 +275,14 @@ def write_reports(
     output_dir: Path,
     title: str,
     tolerance_samples: float,
+    availability_filename: str = "availability.txt",
+    errors_filename: str = "errors.txt",
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
     grouped: dict[str, list[Segment]] = {}
     for segment in segments:
         grouped.setdefault(segment.source_id, []).append(segment)
 
-    rows = []
     text_lines = [f"            {title}", ""]
     for sid in sorted(grouped):
         items = sorted(grouped[sid], key=lambda item: (item.start, item.end, item.file))
@@ -290,34 +295,29 @@ def write_reports(
             text_lines.append(
                 f"    {sid:<24} {fmt_time(item.start):<27} {fmt_time(item.end):<27} {gap_samples:11d} {item.npts:16d}"
             )
-            rows.append(
-                {
-                    "SourceID": sid,
-                    "Start sample": fmt_time(item.start),
-                    "End sample": fmt_time(item.end),
-                    "GapSamples": gap_samples,
-                    "DataSamples": item.npts,
-                }
-            )
             previous = item
         text_lines.append("")
 
-    (output_dir / "availability.txt").write_text("\n".join(text_lines), encoding="utf-8")
-    with (output_dir / "availability.csv").open("w", newline="", encoding="utf-8") as handle:
-        fieldnames = [
-            "SourceID",
-            "Start sample",
-            "End sample",
-            "GapSamples",
-            "DataSamples",
-        ]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    with (output_dir / "errors.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["file", "error"])
-        writer.writeheader()
-        writer.writerows(errors)
+    (output_dir / availability_filename).write_text(
+        "\n".join(text_lines),
+        encoding="utf-8",
+    )
+
+    errors_path = output_dir / errors_filename
+    if errors:
+        error_lines = ["MiniSEED processing errors", ""]
+        for index, error in enumerate(errors, start=1):
+            error_lines.append(f"[{index}] File: {error['file']}")
+            error_lines.append(f"    Error: {error['error']}")
+            error_lines.append("")
+
+        errors_path.write_text(
+            "\n".join(error_lines),
+            encoding="utf-8",
+        )
+    else:
+        # Remove a stale error report left by a previous run.
+        errors_path.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -325,6 +325,13 @@ def main() -> int:
     if not args.input.exists():
         print(f"Input folder not found: {args.input}", file=sys.stderr)
         return 2
+
+    # Remove stale error reports from previous runs. New error files are
+    # created later only when at least one real error is present.
+    args.output.mkdir(parents=True, exist_ok=True)
+    (args.output / "errors.txt").unlink(missing_ok=True)
+    (args.output / "errors_normalized.txt").unlink(missing_ok=True)
+
     segments, errors = scan_mseed(args)
     if args.snap_times:
         segments = snap_segments_to_sample_grid(segments)
@@ -336,15 +343,18 @@ def main() -> int:
         write_reports(
             normalized_segments,
             normalized_errors,
-            args.output / "normalized",
+            args.output,
             "MiniSEED Availability Contents (ObsPy normalized):",
             args.tolerance_samples,
+            availability_filename="availability_normalized.txt",
+            errors_filename="errors_normalized.txt",
         )
         print(f"Normalized segments parsed: {len(normalized_segments)}")
         print(f"Normalized errors: {len(normalized_errors)}")
     print(f"Segments parsed: {len(segments)}")
     print(f"Errors: {len(errors)}")
     print(f"Reports: {args.output}")
+    print(f"Script version: {SCRIPT_VERSION}")
     return 0 if not errors else 1
 
 
