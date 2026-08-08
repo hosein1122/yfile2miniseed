@@ -233,11 +233,16 @@ def write_reports(
     tolerance_samples: float,
 ) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    # حذف خروجی‌های قدیمی این ابزار تا فایل‌های منسوخ یا خطای قبلی باقی نمانند.
+    (output_dir / "availability.txt").unlink(missing_ok=True)
+    (output_dir / "availability.csv").unlink(missing_ok=True)
+    (output_dir / "errors.csv").unlink(missing_ok=True)
+
     grouped: dict[str, list[Segment]] = {}
     for segment in segments:
         grouped.setdefault(segment.source_id, []).append(segment)
 
-    rows = []
     text_lines = [f"            {title}", ""]
     for sid in sorted(grouped):
         items = sorted(grouped[sid], key=lambda item: (item.start, item.end, item.file))
@@ -250,34 +255,20 @@ def write_reports(
             text_lines.append(
                 f"    {sid:<24} {fmt_time(item.start):<27} {fmt_time(item.end):<27} {gap_samples:11d} {item.npts:16d}"
             )
-            rows.append(
-                {
-                    "SourceID": sid,
-                    "Start sample": fmt_time(item.start),
-                    "End sample": fmt_time(item.end),
-                    "GapSamples": gap_samples,
-                    "DataSamples": item.npts,
-                }
-            )
             previous = item
         text_lines.append("")
 
-    (output_dir / "availability.txt").write_text("\n".join(text_lines), encoding="utf-8")
-    with (output_dir / "availability.csv").open("w", newline="", encoding="utf-8") as handle:
-        fieldnames = [
-            "SourceID",
-            "Start sample",
-            "End sample",
-            "GapSamples",
-            "DataSamples",
-        ]
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-    with (output_dir / "errors.csv").open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["file", "error"])
-        writer.writeheader()
-        writer.writerows(errors)
+    (output_dir / "y-availability.txt").write_text(
+        "\n".join(text_lines),
+        encoding="utf-8",
+    )
+
+    # فایل خطا فقط زمانی ساخته می‌شود که دست‌کم یک خطا وجود داشته باشد.
+    if errors:
+        with (output_dir / "errors.csv").open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["file", "error"])
+            writer.writeheader()
+            writer.writerows(errors)
 
 
 def main() -> int:

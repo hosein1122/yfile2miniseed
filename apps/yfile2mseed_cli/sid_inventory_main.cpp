@@ -7,6 +7,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <map>
 #include <set>
@@ -113,6 +114,17 @@ void add_reader_sid(
         discovered.insert(raw);
 }
 
+void print_progress(double value, int& last_percent)
+{
+    int percent = static_cast<int>(value * 100.0 + 0.5);
+    percent = (std::max)(0, (std::min)(100, percent));
+    if (percent == last_percent)
+        return;
+
+    last_percent = percent;
+    std::cout << "\r" << std::setw(3) << percent << "%" << std::flush;
+}
+
 bool scan_yfile_path(const std::string& path, std::set<std::string>& discovered)
 {
     yfile2miniseed::Y5FileReader reader;
@@ -122,7 +134,13 @@ bool scan_yfile_path(const std::string& path, std::set<std::string>& discovered)
     return true;
 }
 
-void scan_zip_path(const std::string& path, std::set<std::string>& discovered, size_t& yfiles)
+void scan_zip_path(
+    const std::string& path,
+    std::set<std::string>& discovered,
+    size_t& yfiles,
+    size_t file_index,
+    size_t file_count,
+    int& last_percent)
 {
     using namespace yfile2miniseed::cli::ziputils;
 
@@ -130,17 +148,37 @@ void scan_zip_path(const std::string& path, std::set<std::string>& discovered, s
         return;
 
     const auto files = ExtractZipToMemory(path);
+    const size_t zip_count = files.empty() ? 1 : files.size();
+    size_t zip_index = 0;
     for (const auto& file : files)
     {
+        ++zip_index;
         if (file.data.empty())
+        {
+            const double fraction = (static_cast<double>(file_index) +
+                (static_cast<double>(zip_index) / static_cast<double>(zip_count))) /
+                static_cast<double>(file_count);
+            print_progress(fraction, last_percent);
             continue;
+        }
 
         yfile2miniseed::Y5FileReader reader;
         if (!reader.ReadFromRAM(file.data.data(), file.data.size()))
+        {
+            const double fraction = (static_cast<double>(file_index) +
+                (static_cast<double>(zip_index) / static_cast<double>(zip_count))) /
+                static_cast<double>(file_count);
+            print_progress(fraction, last_percent);
             continue;
+        }
 
         add_reader_sid(reader, discovered);
         ++yfiles;
+
+        const double fraction = (static_cast<double>(file_index) +
+            (static_cast<double>(zip_index) / static_cast<double>(zip_count))) /
+            static_cast<double>(file_count);
+        print_progress(fraction, last_percent);
     }
 }
 
@@ -209,24 +247,39 @@ int main(int argc, char* argv[])
     size_t errors = 0;
 
     const auto files = collect_files(input);
-    for (const auto& path : files)
+    int last_percent = -1;
+    print_progress(0.0, last_percent);
+    for (size_t index = 0; index < files.size(); ++index)
     {
+        const auto& path = files[index];
         try
         {
             if (scan_yfile_path(path, discovered))
             {
                 ++yfiles;
+                print_progress(
+                    static_cast<double>(index + 1) / static_cast<double>(files.size()),
+                    last_percent);
                 continue;
             }
 
-            scan_zip_path(path, discovered, yfiles);
+            scan_zip_path(path, discovered, yfiles, index, files.size(), last_percent);
+            print_progress(
+                static_cast<double>(index + 1) / static_cast<double>(files.size()),
+                last_percent);
         }
         catch (const std::exception& exc)
         {
             ++errors;
+            print_progress(
+                static_cast<double>(index + 1) / static_cast<double>(files.size()),
+                last_percent);
+            std::cout << "\n";
             std::cerr << "Warning: cannot scan " << path << ": " << exc.what() << "\n";
         }
     }
+    print_progress(1.0, last_percent);
+    std::cout << "\n";
 
     size_t added = 0;
     for (const auto& raw : discovered)
@@ -247,15 +300,6 @@ int main(int argc, char* argv[])
         std::cerr << "Cannot write " << output << ": " << exc.what() << "\n";
         return 1;
     }
-
-    std::cout << "Input files scanned: " << files.size() << "\n";
-    std::cout << "Y-files parsed: " << yfiles << "\n";
-    std::cout << "SID combinations found: " << discovered.size() << "\n";
-    std::cout << "Existing entries preserved: " << (entries.size() - added) << "\n";
-    std::cout << "New entries added: " << added << "\n";
-    std::cout << "Output: " << output << "\n";
-    if (errors)
-        std::cout << "Warnings: " << errors << "\n";
 
     return errors ? 1 : 0;
 }

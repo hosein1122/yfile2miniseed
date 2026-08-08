@@ -45,7 +45,8 @@ MS3Record make_record(
 
 bool add_record(MS3TraceList* traceList, MS3Record& record)
 {
-	return mstl3_addmsr(traceList, &record, 0, 1, 0, nullptr) != nullptr;
+	// Architectural decision: keep adjacent segments separate; do not auto-heal/merge them.
+	return mstl3_addmsr(traceList, &record, 0, 0, 0, nullptr) != nullptr;
 }
 
 int count_segments(MS3TraceList* traceList)

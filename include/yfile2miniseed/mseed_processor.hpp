@@ -123,6 +123,7 @@ namespace yfile2miniseed {
 		bool AppendMSeedFileToPendingSession(const std::string& inputFile);
 		bool ClosePendingWriters();
 		bool FinalizePendingSession(bool miniSeedVersion3 = true);
+		bool FinalizePendingSessionAppendOnly(bool sortAndDeduplicate, bool miniSeedVersion3 = true);
 		const std::filesystem::path& PendingSessionPath() const { return pendingSessionPath; }
 
 		//test
@@ -211,6 +212,14 @@ namespace yfile2miniseed {
 		bool CommitOnePendingFile(
 			const std::filesystem::path& finalPath,
 			const std::filesystem::path& pendingPath,
+			bool miniSeedVersion3);
+		bool CommitOnePendingFileAppendOnly(
+			const std::filesystem::path& finalPath,
+			const std::filesystem::path& pendingPath);
+		bool RewriteFinalFileFromTraceList(
+			const std::filesystem::path& finalPath,
+			uint32_t readFlags,
+			const char* label,
 			bool miniSeedVersion3);
 		bool ValidateMSeedFile(const std::filesystem::path& path) const;
 		bool WriteTraceListFile(

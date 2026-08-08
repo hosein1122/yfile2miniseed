@@ -603,6 +603,49 @@ namespace yfile2miniseed {
 		return true;
 	}
 
+	bool MSeedProcessor::FinalizePendingSessionAppendOnly(bool sortAndDeduplicate, bool miniSeedVersion3)
+	{
+		if (pendingSessionPath.empty())
+			return true;
+
+		if (!ClosePendingWriters())
+			return false;
+
+		std::vector<std::filesystem::path> committedFiles;
+		for (const auto& item : pendingFilesByFinal)
+		{
+			const std::filesystem::path finalPath(item.first);
+			const std::filesystem::path& pendingPath = item.second;
+
+			if (!std::filesystem::exists(pendingPath))
+			{
+				spdlog::warn("Pending file not found, skipping '{}'", pendingPath.string());
+				continue;
+			}
+
+			if (!CommitOnePendingFileAppendOnly(finalPath, pendingPath))
+				return false;
+
+			committedFiles.push_back(finalPath);
+		}
+
+		if (sortAndDeduplicate)
+		{
+			constexpr uint32_t sortReadFlags = MSF_VALIDATECRC | MSF_UNPACKDATA;
+			constexpr uint32_t dedupReadFlags = MSF_VALIDATECRC | MSF_UNPACKDATA | MSF_SKIPADJACENTDUPLICATES;
+			for (const auto& finalPath : committedFiles)
+			{
+				if (!RewriteFinalFileFromTraceList(finalPath, sortReadFlags, "Sort appended SDS", miniSeedVersion3))
+					return false;
+				if (!RewriteFinalFileFromTraceList(finalPath, dedupReadFlags, "Deduplicate appended SDS", miniSeedVersion3))
+					return false;
+			}
+		}
+
+		CleanupPendingSessionIfEmpty();
+		return true;
+	}
+
 
 	// ====================
 	// Private functions
@@ -1059,6 +1102,199 @@ namespace yfile2miniseed {
 		return true;
 	}
 
+	bool MSeedProcessor::CommitOnePendingFileAppendOnly(
+		const std::filesystem::path& finalPath,
+		const std::filesystem::path& pendingPath)
+	{
+		namespace fs = std::filesystem;
+
+		if (!ResolveStaleCommitState(finalPath))
+			return false;
+
+		const std::string workBase = finalPath.filename().string() + "." + pendingSessionName;
+		const fs::path buildingPath = finalPath.parent_path() / (workBase + ".building");
+		const fs::path backupPath = finalPath.parent_path() / (workBase + ".backup");
+
+		if (fs::exists(buildingPath) || fs::exists(backupPath))
+		{
+			spdlog::error("Session work file already exists for '{}'", finalPath.string());
+			return false;
+		}
+
+		try
+		{
+			fs::create_directories(finalPath.parent_path());
+		}
+		catch (const std::exception& ex)
+		{
+			spdlog::error("Cannot create final SDS directory '{}': {}", finalPath.parent_path().string(), ex.what());
+			return false;
+		}
+
+		if (!ValidateMSeedFile(pendingPath))
+			return false;
+
+		if (fs::exists(finalPath))
+		{
+			try
+			{
+				fs::copy_file(finalPath, buildingPath, fs::copy_options::none);
+			}
+			catch (const std::exception& ex)
+			{
+				spdlog::error("Cannot copy original '{}' to building '{}': {}", finalPath.string(), buildingPath.string(), ex.what());
+				return false;
+			}
+
+			std::ifstream in(pendingPath, std::ios::binary);
+			std::ofstream out(buildingPath, std::ios::binary | std::ios::app);
+			out << in.rdbuf();
+			if (!in || !out)
+			{
+				spdlog::error("Cannot append pending '{}' to building '{}'", pendingPath.string(), buildingPath.string());
+				return false;
+			}
+		}
+		else
+		{
+			std::error_code ec;
+			fs::rename(pendingPath, buildingPath, ec);
+			if (ec)
+			{
+				try
+				{
+					fs::copy_file(pendingPath, buildingPath, fs::copy_options::none);
+				}
+				catch (const std::exception& ex)
+				{
+					spdlog::error("Cannot move/copy pending '{}' to building '{}': {}", pendingPath.string(), buildingPath.string(), ex.what());
+					return false;
+				}
+			}
+		}
+
+		if (!ValidateMSeedFile(buildingPath))
+			return false;
+
+		std::error_code ec;
+		const bool hadOriginal = fs::exists(finalPath);
+		if (hadOriginal)
+		{
+			fs::rename(finalPath, backupPath, ec);
+			if (ec)
+			{
+				spdlog::error("Cannot move original '{}' to backup '{}': {}", finalPath.string(), backupPath.string(), ec.message());
+				return false;
+			}
+		}
+
+		fs::rename(buildingPath, finalPath, ec);
+		if (ec)
+		{
+			spdlog::error("Cannot move building '{}' to final '{}': {}", buildingPath.string(), finalPath.string(), ec.message());
+			if (hadOriginal)
+			{
+				std::error_code restoreEc;
+				fs::rename(backupPath, finalPath, restoreEc);
+				if (restoreEc)
+					spdlog::error("Cannot restore backup '{}': {}", backupPath.string(), restoreEc.message());
+			}
+			return false;
+		}
+
+		if (!ValidateMSeedFile(finalPath))
+		{
+			std::error_code removeEc;
+			fs::remove(finalPath, removeEc);
+			if (hadOriginal)
+			{
+				std::error_code restoreEc;
+				fs::rename(backupPath, finalPath, restoreEc);
+				if (restoreEc)
+					spdlog::error("Cannot restore backup '{}': {}", backupPath.string(), restoreEc.message());
+			}
+			return false;
+		}
+
+		if (hadOriginal)
+			fs::remove(backupPath, ec);
+		fs::remove(pendingPath, ec);
+
+		return true;
+	}
+
+	bool MSeedProcessor::RewriteFinalFileFromTraceList(
+		const std::filesystem::path& finalPath,
+		uint32_t readFlags,
+		const char* label,
+		bool miniSeedVersion3)
+	{
+		namespace fs = std::filesystem;
+
+		if (!ResolveStaleCommitState(finalPath))
+			return false;
+
+		const std::string workBase = finalPath.filename().string() + "." + pendingSessionName;
+		const fs::path buildingPath = finalPath.parent_path() / (workBase + ".building");
+		const fs::path backupPath = finalPath.parent_path() / (workBase + ".backup");
+
+		if (fs::exists(buildingPath) || fs::exists(backupPath))
+		{
+			spdlog::error("Session work file already exists for '{}'", finalPath.string());
+			return false;
+		}
+
+		MS3TraceList* traceList = nullptr;
+		if (!ReadMSeedTo(finalPath.string(), traceList, readFlags, label))
+		{
+			mstl3_free(&traceList, 1);
+			return false;
+		}
+
+		if (!WriteTraceListFile(traceList, buildingPath, miniSeedVersion3))
+		{
+			mstl3_free(&traceList, 1);
+			return false;
+		}
+		mstl3_free(&traceList, 1);
+
+		if (!ValidateMSeedFile(buildingPath))
+			return false;
+
+		std::error_code ec;
+		fs::rename(finalPath, backupPath, ec);
+		if (ec)
+		{
+			spdlog::error("Cannot move original '{}' to backup '{}': {}", finalPath.string(), backupPath.string(), ec.message());
+			return false;
+		}
+
+		fs::rename(buildingPath, finalPath, ec);
+		if (ec)
+		{
+			spdlog::error("Cannot move building '{}' to final '{}': {}", buildingPath.string(), finalPath.string(), ec.message());
+			std::error_code restoreEc;
+			fs::rename(backupPath, finalPath, restoreEc);
+			if (restoreEc)
+				spdlog::error("Cannot restore backup '{}': {}", backupPath.string(), restoreEc.message());
+			return false;
+		}
+
+		if (!ValidateMSeedFile(finalPath))
+		{
+			std::error_code removeEc;
+			fs::remove(finalPath, removeEc);
+			std::error_code restoreEc;
+			fs::rename(backupPath, finalPath, restoreEc);
+			if (restoreEc)
+				spdlog::error("Cannot restore backup '{}': {}", backupPath.string(), restoreEc.message());
+			return false;
+		}
+
+		fs::remove(backupPath, ec);
+		return true;
+	}
+
 	void MSeedProcessor::CleanupPendingSessionIfEmpty() const
 	{
 		if (pendingSessionPath.empty())
@@ -1125,7 +1361,7 @@ namespace yfile2miniseed {
 		msr->samplecnt = numsamples;
 		msr->starttime = startTime;
 
-		//if (mstl3_addmsr_recordptr(Outmstl, msr, &recordptr, 0, 1, flags, NULL) == NULL)
+		// Architectural decision: keep adjacent segments separate; do not auto-heal/merge them.
 		if (!mstl3_addmsr(out_mstl, msr, 0, 0, flags, NULL))
 		{
 			spdlog::error("mstl3_addmsr() failed for SID: {}", sid);

@@ -158,7 +158,7 @@ copy /Y "%REPORT_TMP%\yfile\availability.txt" "%RESULT_DIR%\yfile_availability.t
 echo Building center availability reports...
 call :clean_dir "%REPORT_TMP%\center"
 if errorlevel 1 exit /b 1
-%PYTHON% "%~dp0mseed_availability_report.py" --input "%CENTER_OUTPUT%" --output "%REPORT_TMP%\center" %STATION_ARG% --write-normalized --snap-times
+%PYTHON% "%~dp0sds_availability_report.py" --input "%CENTER_OUTPUT%" --output "%REPORT_TMP%\center" %STATION_ARG% --write-normalized --snap-times
 if errorlevel 1 exit /b %ERRORLEVEL%
 copy /Y "%REPORT_TMP%\center\availability.txt" "%RESULT_DIR%\center_availability.txt" >nul
 copy /Y "%REPORT_TMP%\center\normalized\availability.txt" "%RESULT_DIR%\center_normalized_availability.txt" >nul
@@ -166,7 +166,7 @@ copy /Y "%REPORT_TMP%\center\normalized\availability.txt" "%RESULT_DIR%\center_n
 echo Building our availability report...
 call :clean_dir "%REPORT_TMP%\ours"
 if errorlevel 1 exit /b 1
-%PYTHON% "%~dp0mseed_availability_report.py" --input "%OUR_OUTPUT%" --output "%REPORT_TMP%\ours" %STATION_ARG% --snap-times
+%PYTHON% "%~dp0sds_availability_report.py" --input "%OUR_OUTPUT%" --output "%REPORT_TMP%\ours" %STATION_ARG% --snap-times
 if errorlevel 1 exit /b %ERRORLEVEL%
 copy /Y "%REPORT_TMP%\ours\availability.txt" "%RESULT_DIR%\our_availability.txt" >nul
 

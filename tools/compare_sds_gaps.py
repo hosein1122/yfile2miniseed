@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import csv
-import json
 import re
 import sys
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import obspy
@@ -59,7 +57,7 @@ class GapEntry:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Save ordered ObsPy gap/overlap lists for two SDS trees and compare them."
+        description="Save ordered ObsPy gap/overlap text reports for two SDS trees and compare them."
     )
     parser.add_argument("--sds-a", required=True, type=Path, help="First SDS root.")
     parser.add_argument("--sds-b", required=True, type=Path, help="Second SDS root.")
@@ -166,7 +164,18 @@ def scan_gap_entries(
                 )
             )
 
-    return sorted(entries, key=lambda item: (item.stream_id, item.previous_end_ns, item.next_start_ns, item.kind)), errors
+    return (
+        sorted(
+            entries,
+            key=lambda item: (
+                item.stream_id,
+                item.previous_end_ns,
+                item.next_start_ns,
+                item.kind,
+            ),
+        ),
+        errors,
+    )
 
 
 def same_gap(left: GapEntry, right: GapEntry, tolerance_ns: int) -> bool:
@@ -254,108 +263,264 @@ def compare_gap_entries(
     )
 
 
-def write_gap_csv(path: Path, rows: list[GapEntry]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(
-            handle,
-            fieldnames=[
-                "stream_id",
-                "kind",
-                "previous_end_utc",
-                "next_start_utc",
-                "previous_end_ns",
-                "next_start_ns",
-                "delta_seconds",
-                "samples",
-            ],
+def remove_previous_outputs(report: Path, a_label: str, b_label: str) -> None:
+    """Remove current and legacy report files so stale results are never kept."""
+    names = {
+        "report.txt",
+        "report.json",
+        "gap_comparison.txt",
+        "gap_comparison.csv",
+        f"gaps_{a_label}.txt",
+        f"gaps_{b_label}.txt",
+        f"gaps_{a_label}.csv",
+        f"gaps_{b_label}.csv",
+        f"errors_{a_label}.txt",
+        f"errors_{b_label}.txt",
+        f"errors_{a_label}.csv",
+        f"errors_{b_label}.csv",
+    }
+    for name in names:
+        (report / name).unlink(missing_ok=True)
+
+
+def format_gap_entry(index: int, entry: GapEntry) -> list[str]:
+    return [
+        f"[{index}] {entry.kind}  {entry.stream_id}",
+        f"    Previous end UTC : {entry.previous_end_utc}",
+        f"    Next start UTC   : {entry.next_start_utc}",
+        f"    Delta seconds    : {entry.delta_seconds:.9f}",
+        f"    Samples          : {entry.samples}",
+        f"    Previous end ns  : {entry.previous_end_ns}",
+        f"    Next start ns    : {entry.next_start_ns}",
+        "",
+    ]
+
+
+def write_gap_report(
+    path: Path,
+    label: str,
+    sds_root: Path,
+    rows: list[GapEntry],
+) -> bool:
+    """Write a gap report only when at least one gap/overlap exists."""
+    if not rows:
+        path.unlink(missing_ok=True)
+        return False
+
+    lines = [
+        f"SDS Gap/Overlap Report: {label}",
+        f"SDS root: {sds_root}",
+        f"Entries: {len(rows)}",
+        "",
+    ]
+    for index, entry in enumerate(rows, start=1):
+        lines.extend(format_gap_entry(index, entry))
+
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return True
+
+
+def write_comparison_report(
+    path: Path,
+    rows: list[dict],
+    a_label: str,
+    b_label: str,
+    tolerance_ns: int,
+) -> bool:
+    """Write only unmatched gaps/overlaps; create no file when both sides match."""
+    if not rows:
+        path.unlink(missing_ok=True)
+        return False
+
+    lines = [
+        "SDS Gap/Overlap Differences",
+        f"First SDS label : {a_label}",
+        f"Second SDS label: {b_label}",
+        f"Time tolerance  : {tolerance_ns} ns",
+        f"Differences     : {len(rows)}",
+        "",
+    ]
+
+    for index, row in enumerate(rows, start=1):
+        lines.extend(
+            [
+                f"[{index}] {row['status']}",
+                f"    Owner            : {row['gap_owner']}",
+                f"    Stream ID        : {row['stream_id']}",
+                f"    Kind             : {row['kind']}",
+                f"    Previous end UTC : {row['previous_end_utc']}",
+                f"    Next start UTC   : {row['next_start_utc']}",
+                f"    Delta seconds    : {float(row['delta_seconds']):.9f}",
+                f"    Samples          : {row['samples']}",
+                f"    Previous end ns  : {row['previous_end_ns']}",
+                f"    Next start ns    : {row['next_start_ns']}",
+                "",
+            ]
         )
-        writer.writeheader()
-        writer.writerows(asdict(item) for item in rows)
+
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return True
 
 
-def write_dict_csv(path: Path, rows: list[dict]) -> None:
-    if rows:
-        fieldnames = list(rows[0].keys())
+def write_error_report(path: Path, label: str, rows: list[dict]) -> bool:
+    """Write an error report only when real errors exist."""
+    if not rows:
+        path.unlink(missing_ok=True)
+        return False
+
+    lines = [
+        f"SDS Processing Errors: {label}",
+        f"Errors: {len(rows)}",
+        "",
+    ]
+    for index, row in enumerate(rows, start=1):
+        lines.extend(
+            [
+                f"[{index}] File: {row.get('file', '')}",
+                f"    Error: {row.get('error', '')}",
+                "",
+            ]
+        )
+
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    return True
+
+
+def write_summary_report(
+    path: Path,
+    *,
+    sds_a: Path,
+    sds_b: Path,
+    a_label: str,
+    b_label: str,
+    a_report_label: str,
+    b_report_label: str,
+    tolerance_ns: int,
+    gap_count_a: int,
+    gap_count_b: int,
+    difference_count: int,
+    errors_a: int,
+    errors_b: int,
+    generated_files: list[str],
+    ok: bool,
+) -> None:
+    lines = [
+        "SDS Gap/Overlap Comparison Summary",
+        "",
+        f"SDS A              : {sds_a}",
+        f"SDS B              : {sds_b}",
+        f"Label A            : {a_label}",
+        f"Label B            : {b_label}",
+        f"Report label A     : {a_report_label}",
+        f"Report label B     : {b_report_label}",
+        f"Python             : {sys.version.split()[0]}",
+        f"ObsPy              : {obspy.__version__}",
+        f"Time tolerance     : {tolerance_ns} ns",
+        "",
+        f"Gap/overlap count A: {gap_count_a}",
+        f"Gap/overlap count B: {gap_count_b}",
+        f"Differences        : {difference_count}",
+        f"Errors A           : {errors_a}",
+        f"Errors B           : {errors_b}",
+        f"Result             : {'OK' if ok else 'DIFFERENCES OR ERRORS FOUND'}",
+        "",
+        "Generated detail reports:",
+    ]
+
+    if generated_files:
+        lines.extend(f"  - {name}" for name in generated_files)
     else:
-        fieldnames = [
-            "status",
-            "gap_owner",
-            "stream_id",
-            "kind",
-            "previous_end_utc",
-            "next_start_utc",
-            "previous_end_ns",
-            "next_start_ns",
-            "delta_seconds",
-            "samples",
-        ]
+        lines.append("  None; no gaps, overlaps, differences, or errors were found.")
 
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(rows)
-
-
-def write_error_csv(path: Path, rows: list[dict]) -> None:
-    with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=["file", "error"])
-        writer.writeheader()
-        writer.writerows(rows)
+    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
 
 
 def main() -> int:
     args = parse_args()
-    report = args.report
+    report = args.report.resolve()
     report.mkdir(parents=True, exist_ok=True)
 
+    sds_a = args.sds_a.resolve()
+    sds_b = args.sds_b.resolve()
     networks = normalized_filter(args.network)
     stations = normalized_filter(args.station)
     channels = normalized_filter(args.channel)
     a_label = safe_label(args.a_label)
     b_label = safe_label(args.b_label)
 
-    print(f"Python {sys.version.split()[0]} | ObsPy {obspy.__version__}")
-    print(f"Scanning {args.a_label}: {args.sds_a}")
-    gaps_a, errors_a = scan_gap_entries(args.sds_a, networks, stations, channels)
-    print(f"Scanning {args.b_label}: {args.sds_b}")
-    gaps_b, errors_b = scan_gap_entries(args.sds_b, networks, stations, channels)
+    remove_previous_outputs(report, a_label, b_label)
 
-    comparison = compare_gap_entries(
+    print(f"Python {sys.version.split()[0]} | ObsPy {obspy.__version__}")
+    print(f"Scanning {args.a_label}: {sds_a}")
+    gaps_a, errors_a = scan_gap_entries(sds_a, networks, stations, channels)
+    print(f"Scanning {args.b_label}: {sds_b}")
+    gaps_b, errors_b = scan_gap_entries(sds_b, networks, stations, channels)
+
+    differences = compare_gap_entries(
         gaps_a,
         gaps_b,
         args.time_tolerance_ns,
         a_label,
         b_label,
     )
-    different_rows = [row for row in comparison if row["status"] != "MATCH"]
 
-    write_gap_csv(report / f"gaps_{a_label}.csv", gaps_a)
-    write_gap_csv(report / f"gaps_{b_label}.csv", gaps_b)
-    write_dict_csv(report / "gap_comparison.csv", comparison)
-    write_error_csv(report / f"errors_{a_label}.csv", errors_a)
-    write_error_csv(report / f"errors_{b_label}.csv", errors_b)
+    generated_files: list[str] = []
 
-    summary = {
-        "sds_a": str(args.sds_a),
-        "sds_b": str(args.sds_b),
-        "a_label": args.a_label,
-        "b_label": args.b_label,
-        "a_report_label": a_label,
-        "b_report_label": b_label,
-        "obspy": obspy.__version__,
-        "time_tolerance_ns": args.time_tolerance_ns,
-        "gap_count_a": len(gaps_a),
-        "gap_count_b": len(gaps_b),
-        "comparison_rows": len(comparison),
-        "different_rows": len(different_rows),
-        "errors_a": len(errors_a),
-        "errors_b": len(errors_b),
-        "ok": not different_rows and not errors_a and not errors_b,
-    }
-    (report / "report.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    gaps_a_path = report / f"gaps_{a_label}.txt"
+    if write_gap_report(gaps_a_path, args.a_label, sds_a, gaps_a):
+        generated_files.append(gaps_a_path.name)
 
-    print(json.dumps(summary, indent=2))
-    if summary["ok"] or args.allow_differences:
+    gaps_b_path = report / f"gaps_{b_label}.txt"
+    if write_gap_report(gaps_b_path, args.b_label, sds_b, gaps_b):
+        generated_files.append(gaps_b_path.name)
+
+    comparison_path = report / "gap_comparison.txt"
+    if write_comparison_report(
+        comparison_path,
+        differences,
+        args.a_label,
+        args.b_label,
+        args.time_tolerance_ns,
+    ):
+        generated_files.append(comparison_path.name)
+
+    errors_a_path = report / f"errors_{a_label}.txt"
+    if write_error_report(errors_a_path, args.a_label, errors_a):
+        generated_files.append(errors_a_path.name)
+
+    errors_b_path = report / f"errors_{b_label}.txt"
+    if write_error_report(errors_b_path, args.b_label, errors_b):
+        generated_files.append(errors_b_path.name)
+
+    ok = not differences and not errors_a and not errors_b
+    summary_path = report / "report.txt"
+    write_summary_report(
+        summary_path,
+        sds_a=sds_a,
+        sds_b=sds_b,
+        a_label=args.a_label,
+        b_label=args.b_label,
+        a_report_label=a_label,
+        b_report_label=b_label,
+        tolerance_ns=args.time_tolerance_ns,
+        gap_count_a=len(gaps_a),
+        gap_count_b=len(gaps_b),
+        difference_count=len(differences),
+        errors_a=len(errors_a),
+        errors_b=len(errors_b),
+        generated_files=generated_files,
+        ok=ok,
+    )
+
+    print(f"Gap/overlap count {args.a_label}: {len(gaps_a)}")
+    print(f"Gap/overlap count {args.b_label}: {len(gaps_b)}")
+    print(f"Differences: {len(differences)}")
+    print(f"Errors {args.a_label}: {len(errors_a)}")
+    print(f"Errors {args.b_label}: {len(errors_b)}")
+    print(f"Result: {'OK' if ok else 'DIFFERENCES OR ERRORS FOUND'}")
+    print(f"Summary report: {summary_path}")
+
+    if ok or args.allow_differences:
         return 0
     if errors_a or errors_b:
         return 2

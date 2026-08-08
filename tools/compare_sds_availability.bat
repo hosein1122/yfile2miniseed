@@ -81,14 +81,14 @@ if errorlevel 1 exit /b 1
 echo Building first SDS availability report...
 call :clean_dir "%REPORT_TMP%\sds_a"
 if errorlevel 1 exit /b 1
-%PYTHON% "%~dp0mseed_availability_report.py" --input "%SDS_A%" --output "%REPORT_TMP%\sds_a" %STATION_ARG% %CHANNEL_ARG% --snap-times
+%PYTHON% "%~dp0sds_availability_report.py" --input "%SDS_A%" --output "%REPORT_TMP%\sds_a" %STATION_ARG% %CHANNEL_ARG% --snap-times
 if errorlevel 1 exit /b %ERRORLEVEL%
 copy /Y "%REPORT_TMP%\sds_a\availability.txt" "%RESULT_DIR%\sds_a_availability.txt" >nul
 
 echo Building second SDS availability report...
 call :clean_dir "%REPORT_TMP%\sds_b"
 if errorlevel 1 exit /b 1
-%PYTHON% "%~dp0mseed_availability_report.py" --input "%SDS_B%" --output "%REPORT_TMP%\sds_b" %STATION_ARG% %CHANNEL_ARG% --snap-times
+%PYTHON% "%~dp0sds_availability_report.py" --input "%SDS_B%" --output "%REPORT_TMP%\sds_b" %STATION_ARG% %CHANNEL_ARG% --snap-times
 if errorlevel 1 exit /b %ERRORLEVEL%
 copy /Y "%REPORT_TMP%\sds_b\availability.txt" "%RESULT_DIR%\sds_b_availability.txt" >nul
 

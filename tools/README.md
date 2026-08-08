@@ -51,7 +51,7 @@ python tools\sds_obspy_cleanup_inplace.py ^
 sds_obspy_cleanup_inplace.py  Post-process a standard SDS tree in place with
                               ObsPy Stream.merge(method=-1).
 
-mseed_availability_report.py  Build availability reports from MiniSEED/SDS.
+sds_availability_report.py  Build availability reports from MiniSEED/SDS.
                               This is a reporting tool, not a cleanup tool.
                               Its normalized report uses ObsPy method=-1.
 
