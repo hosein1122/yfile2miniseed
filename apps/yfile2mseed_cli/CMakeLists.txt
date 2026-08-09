@@ -64,3 +64,19 @@ target_include_directories(yfile2mseed_sid_scan
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
 )
+
+add_executable(yfile2obspy_bridge
+    bridge_main.cpp
+    utils/zip_utils.cpp
+)
+
+target_link_libraries(yfile2obspy_bridge
+    PRIVATE
+        yfile2miniseed_lib
+        libzip::zip
+)
+
+target_include_directories(yfile2obspy_bridge
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+)

@@ -63,6 +63,11 @@ def parse_args() -> argparse.Namespace:
         help="Suppress per-item progress messages while keeping the final summary.",
     )
     parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Print selected stage timings to the console. JSON reports remain detailed.",
+    )
+    parser.add_argument(
         "--pack-backend",
         choices=("auto", "memory", "disk"),
         default="auto",
@@ -1562,6 +1567,7 @@ def main() -> int:
         "correct_sid": str(args.correct_sid.resolve()) if corrections is not None else None,
         "progress_every": args.progress_every,
         "quiet": args.quiet,
+        "benchmark": args.benchmark,
         "zip_prefetch": args.zip_prefetch,
         "y_workers": args.y_workers,
         "y_chunk_size": args.y_chunk_size,
@@ -1607,17 +1613,40 @@ def main() -> int:
         args.report.parent.mkdir(parents=True, exist_ok=True)
         args.report.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    print()
-    print("Stage timings:")
-    for name, seconds in sorted(
-        report["timings_seconds"].items(),
-        key=lambda item: item[1],
-        reverse=True,
-    ):
-        print(f"  {name:30s} {seconds:12.6f} s")
+    if args.benchmark:
+        print()
+        print("Benchmark timings:")
+        benchmark_names = [
+            "input_pipeline_wall",
+            "parallel_decode_wall",
+            "bridge_read_wall",
+            "merge_method_minus_1",
+            "parallel_pack_wall",
+            "pack_total",
+            "sds_output_total",
+            "pack_and_sds_pipeline_wall",
+            "elapsed_seconds",
+        ]
+        for name in benchmark_names:
+            if name == "elapsed_seconds":
+                seconds = report["elapsed_seconds"]
+            elif name in report["timings_seconds"]:
+                seconds = report["timings_seconds"][name]
+            else:
+                continue
+            print(f"  {name:30s} {seconds:12.6f} s")
 
     print("Completed successfully")
-    print(json.dumps(report, indent=2, ensure_ascii=False))
+    print(
+        "Summary: "
+        f"elapsed={report['elapsed_seconds']:.6f}s, "
+        f"files={report['files_read']}, "
+        f"samples={report['samples_written']}, "
+        f"records={report['records_written']}, "
+        f"sds_files={report['sds_files_written']}"
+    )
+    if args.report:
+        print(f"Report: {args.report}")
     return 0
 
 

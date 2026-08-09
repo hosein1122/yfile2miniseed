@@ -23,7 +23,7 @@ if exist out\build\x64-Release rmdir /s /q out\build\x64-Release
 cmake -S . -B out\build\x64-Release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
 cmake --build out\build\x64-Release --config Release
 out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_sid_scan.exe D:\inputYFiles -o CorrectSID.txt
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\inputYFiles -o D:\OutputStore -V2
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\inputYFiles -o D:\OutputStore -V2
 ```
 
 Use `-V2` when you need MiniSEED 2 output, for example when validating with
@@ -47,6 +47,89 @@ support that is not assumed by this project.
   records.
 - Does not perform full deduplication or overlap cleanup in project C++ code.
 - Builds a reusable static library plus a command-line executable.
+
+## Current Conversion Choices
+
+There are two recommended conversion paths in this repository.
+
+### Current C++ Converter
+
+`yfile2mseed_append.exe` is the current C++ operational converter. It reads
+Y-files/ZIP input and writes SDS MiniSEED directly through the project C++ and
+libmseed path:
+
+```bat
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe ^
+  D:\YFiles ^
+  -o D:\SDS_append_cpp ^
+  -V2
+```
+
+This is the fastest path and is the current C++ result to compare against.
+
+### Balanced Hybrid Converter
+
+`yfiles_to_mseed_sds_hybrid_cppread.py` plus `yfile2obspy_bridge.exe` is the
+balanced validation path. The bridge uses the C++ reader for Y-files and ZIP
+members, then Python/ObsPy receives the samples in memory and applies the same
+conservative `Stream.merge(method=-1)`, MiniSEED packing, and SDS writing logic
+as the ObsPy converter.
+
+The bridge executable itself is intentionally a quiet binary backend. Progress
+is printed by the Python hybrid wrapper from the total source byte count reported
+by the bridge.
+
+Build the bridge:
+
+```bat
+cmake --build out\build\x64-Release --target yfile2obspy_bridge --config Release
+```
+
+Run the hybrid converter:
+
+```bat
+python tools\yfiles_to_mseed_sds_hybrid_cppread.py ^
+  --input-root D:\YFiles ^
+  --output-root D:\SDS_hybrid ^
+  --bridge-exe out\build\x64-Release\apps\yfile2mseed_cli\yfile2obspy_bridge.exe ^
+  --correct-sid CorrectSID.txt ^
+  --encoding STEIM2 ^
+  --record-length 4096 ^
+  --pack-workers 4 ^
+  --recursive ^
+  --report D:\SDS_hybrid_report.json
+```
+
+Add `--benchmark` when you want stage timings printed on the console. Without
+`--benchmark`, the Python converters keep console output short and write the
+detailed JSON report to the path passed with `--report`.
+
+### Compare C++ Append And Hybrid Outputs
+
+Use the batch workflow below to build both SDS trees from the same Y-file input,
+run the same ObsPy cleanup on both, and write availability, gap/overlap, archive,
+and optional sample-window comparison reports:
+
+```bat
+tools\compare_append_vs_hybrid_sds.bat ^
+  D:\YFiles ^
+  D:\CompareRuns\append_vs_hybrid ^
+  D:\MSeed_Test\app\CorrectSID.txt
+```
+
+Optional exact sample-window check:
+
+```bat
+tools\compare_append_vs_hybrid_sds.bat ^
+  D:\YFiles ^
+  D:\CompareRuns\append_vs_hybrid ^
+  D:\MSeed_Test\app\CorrectSID.txt ^
+  IR.SHI..BHE ^
+  2010-01-07T00:00:00 ^
+  2010-01-07T00:10:00
+```
+
+Important report files are written under `RESULT_ROOT\reports`.
 
 ## Folder Guide
 
@@ -172,10 +255,10 @@ out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_sid_scan.exe ^
   -o CorrectSID.txt
 ```
 
-2. Run the converter:
+2. Run the current C++ append converter:
 
 ```bat
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe ^
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe ^
   D:\YFiles ^
   -o D:\SDS ^
   -V2
@@ -203,21 +286,21 @@ python tools\compare_mseed_outputs.py ^
   --id-mode strict
 ```
 
-## Run The Converter
+## Run The C++ Converter
 
 General form:
 
 ```bat
-yfile2mseed.exe inputPath [-o outputDir] [-R minRamGb] [-V2] [-h]
+yfile2mseed_append.exe inputPath [-o outputDir] [-R minRamGb] [-V2] [-h]
 ```
 
 Examples:
 
 ```bat
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\YFiles -o D:\SDS
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\YFiles -o D:\SDS -V2
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\one_file.mseed -o D:\SDS -V2
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe D:\LooseMSeedFiles -o D:\SDS -V2
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\YFiles -o D:\SDS
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\YFiles -o D:\SDS -V2
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\one_file.mseed -o D:\SDS -V2
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\LooseMSeedFiles -o D:\SDS -V2
 ```
 
 Arguments:
