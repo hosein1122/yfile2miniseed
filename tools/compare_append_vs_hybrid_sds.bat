@@ -45,12 +45,6 @@ if exist "%SCRIPT_DIR%yfile2mseed_append.exe" (
   set "APPEND_EXE=%BUILD_EXE_DIR%\yfile2mseed_append.exe"
 )
 
-if exist "%SCRIPT_DIR%yfile2obspy_bridge.exe" (
-  set "BRIDGE_EXE=%SCRIPT_DIR%yfile2obspy_bridge.exe"
-) else (
-  set "BRIDGE_EXE=%BUILD_EXE_DIR%\yfile2obspy_bridge.exe"
-)
-
 if not exist "%APPEND_EXE%" (
   echo yfile2mseed_append.exe not found:
   echo   "%APPEND_EXE%"
@@ -58,10 +52,11 @@ if not exist "%APPEND_EXE%" (
   exit /b 2
 )
 
-if not exist "%BRIDGE_EXE%" (
-  echo yfile2obspy_bridge.exe not found:
-  echo   "%BRIDGE_EXE%"
-  echo Build the Release target first, or copy the exe next to this batch file.
+python -c "import yfile2obspy_cpp" >nul 2>nul
+if errorlevel 1 (
+  echo Python package yfile2obspy_cpp is not installed for this Python.
+  echo Install it from the repository root with:
+  echo   python -m pip install --force-reinstall .\python\yfile2obspy_cpp
   exit /b 2
 )
 
@@ -121,12 +116,10 @@ echo [2/8] Building SDS with hybrid C++ reader + ObsPy writer...
 python "%HYBRID_SCRIPT%" ^
   --input-root "%INPUT_ROOT%" ^
   --output-root "%SDS_HYBRID%" ^
-  --bridge-exe "%BRIDGE_EXE%" ^
   --correct-sid "%CORRECT_SID%" ^
   --encoding STEIM2 ^
   --record-length 4096 ^
   --pack-workers 4 ^
-  --recursive ^
   --benchmark ^
   --report "%REPORTS%\hybrid_report.json"
 if errorlevel 1 exit /b %errorlevel%

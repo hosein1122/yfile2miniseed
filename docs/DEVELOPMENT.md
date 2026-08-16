@@ -59,7 +59,19 @@ error_files.txt
 ## Validation Workflows
 
 For repeatable local validation against another converter or another SDS
-archive, prefer the generic comparison tool:
+archive, prefer the generic comparison tools. The main product path to validate
+is the hybrid converter:
+
+```bat
+python tools\yfiles_to_mseed_sds_hybrid_cppread.py ^
+  --input-root D:\YFiles ^
+  --output-root D:\MainSDS ^
+  --correct-sid CorrectSID.txt ^
+  --quiet ^
+  --report D:\MainSDS_hybrid_report.json
+```
+
+For arbitrary SDS-to-SDS comparison, use:
 
 ```bat
 python tools\compare_mseed_outputs.py ^
@@ -100,11 +112,12 @@ artifact named:
 yfile2miniseed-windows-x64.zip
 ```
 
-The package contains:
+The Windows C++ package contains:
 
 ```text
-yfile2mseed.exe
+yfile2mseed_append.exe
 yfile2mseed_sid_scan.exe
+yfile2obspy_bridge.exe
 yfile2miniseed_lib.lib
 include/
 tools/
@@ -112,6 +125,17 @@ docs/
 README.md
 LICENSE
 ```
+
+The Python reader is packaged separately from `python/yfile2obspy_cpp`:
+
+```bat
+cd python\yfile2obspy_cpp
+python -m build --wheel
+```
+
+The hybrid converter should prefer the installed `yfile2obspy_cpp` extension.
+`yfile2obspy_bridge.exe` is retained as a compatibility fallback and for local
+diagnostics.
 
 To create an official downloadable GitHub Release, tag a tested commit with a
 version tag such as:

@@ -1,59 +1,170 @@
 @echo off
 cd /d "%~dp0"
 
-set "inputYFile=D:\MSeed_Test\Data\shi201001.month"
-set "SDS_our=D:\MSeed_Test\Result\shi201001.month\our"
-set "SDS_obspy=D:\MSeed_Test\Result\shi201001.month\obspy"
-set "gap_report=D:\MSeed_Test\Result\shi201001.month\gap_report"
-set "Availability_report=D:\MSeed_Test\Result\shi201001.month\Availability"
+set "TestFolderName=shi201001.month"
+
+set "inputYFile=D:\MSeed_Test\Data\%TestFolderName%"
+set "SDS_result=D:\MSeed_Test\Result\%TestFolderName%"
+set "gap_report=%SDS_result%\gap_report"
+set "Availability_report=%SDS_result%\Availability"
+set "RawSegment_report=%SDS_result%\RawSegments"
+set "SampleCompare_report=%SDS_result%\SampleCompare"
+
+rem Update these three values for the station/component/time window you want to verify sample-by-sample.
+set "SampleStreamID=IR.PAR..SPE"
+set "SampleStart=2010-01-03T08:17:35"
+set "SampleEnd=2010-01-03T09:00:12"
+
+if not exist "%gap_report%" mkdir "%gap_report%"
+if not exist "%Availability_report%" mkdir "%Availability_report%"
+if not exist "%RawSegment_report%" mkdir "%RawSegment_report%"
+if not exist "%SampleCompare_report%" mkdir "%SampleCompare_report%"
 
 echo.
 echo ============================================================
-echo [1/7] Convert Y-files to SDS with the C++ application
+echo [1/9] Convert Y-files to SDS with the C++ application
 echo ============================================================
 echo.
 
-.\yfile2mseed.exe "%inputYFile%" -o "%SDS_our%" -V2
+.\yfile2mseed_append.exe "%inputYFile%" -o "%SDS_result%\our" -V2 --workers 4
 
 echo.
 pause
+
 echo ============================================================
-echo [2/7] Build the reference SDS with ObsPy
+echo [2-1/9] Build the reference SDS with ObsPy
 echo ============================================================
 echo.
 
 python .\yfiles_to_mseed_sds_obspy.py ^
   --input-root "%inputYFile%" ^
-  --output-root "%SDS_obspy%" ^
+  --output-root "%SDS_result%\obspy" ^
   --recursive
 
 echo.
 pause
 
 echo ============================================================
-echo [3/7] Clean both SDS archives with ObsPy
+echo [2-2/9] Build the reference SDS with hybrid (ObsPy+C++)
 echo ============================================================
 echo.
 
-python.exe .\sds_obspy_cleanup_inplace.py --sds-root "%SDS_our%"
-python.exe .\sds_obspy_cleanup_inplace.py --sds-root "%SDS_obspy%"
+python .\yfiles_to_mseed_sds_hybrid_cppread.py ^
+  --input-root "%inputYFile%" ^
+  --output-root "%SDS_result%\hybrid" ^
+  --correct-sid .\CorrectSID.txt ^
+  --encoding STEIM2 ^
+  --record-length 4096 ^
+  --pack-workers 4
+
+echo.
+pause
+
+echo ============================================================
+echo [3/9] Clean SDS archives with ObsPy merge(method=-1)
+echo ============================================================
+echo.
+
+python.exe .\sds_obspy_cleanup_inplace.py --sds-root "%SDS_result%\our"
+python.exe .\sds_obspy_cleanup_inplace.py --sds-root "%SDS_result%\obspy"
+python.exe .\sds_obspy_cleanup_inplace.py --sds-root "%SDS_result%\hybrid"
+python.exe .\sds_obspy_cleanup_inplace.py --sds-root "%SDS_result%\Any2MSeed.Center"
 
 echo.
 echo ============================================================
-echo [4/7] Compare gaps and overlaps
+echo [4/9] Compare gaps and overlaps
 echo ============================================================
 echo.
 
 python.exe .\compare_sds_gaps.py ^
-  --sds-a "%SDS_obspy%" ^
-  --sds-b "%SDS_our%" ^
-  --report "%gap_report%" ^
+  --sds-a "%SDS_result%\obspy" ^
+  --sds-b "%SDS_result%\our" ^
+  --report "%gap_report%\obspy-our" ^
   --a-label obspy ^
   --b-label our
 
+python.exe .\compare_sds_gaps.py ^
+  --sds-a "%SDS_result%\obspy" ^
+  --sds-b "%SDS_result%\Any2MSeed.Center" ^
+  --report "%gap_report%\obspy-center" ^
+  --a-label obspy ^
+  --b-label center
+
+python.exe .\compare_sds_gaps.py ^
+  --sds-a "%SDS_result%\obspy" ^
+  --sds-b "%SDS_result%\hybrid" ^
+  --report "%gap_report%\obspy-hybrid" ^
+  --a-label obspy ^
+  --b-label hybrid
+
 echo.
 echo ============================================================
-echo [5/7] Create the availability report from the original Y-files
+echo [5/9] Create raw SDS segment reports without trace merging
+echo ============================================================
+echo.
+
+python .\sds_raw_segment_report.py ^
+  --input "%SDS_result%\our" ^
+  --output "%RawSegment_report%\our_raw_segments.txt"
+
+python .\sds_raw_segment_report.py ^
+  --input "%SDS_result%\obspy" ^
+  --output "%RawSegment_report%\obspy_raw_segments.txt"
+
+python .\sds_raw_segment_report.py ^
+  --input "%SDS_result%\hybrid" ^
+  --output "%RawSegment_report%\hybrid_raw_segments.txt"
+
+python .\sds_raw_segment_report.py ^
+  --input "%SDS_result%\Any2MSeed.Center" ^
+  --output "%RawSegment_report%\center_raw_segments.txt"
+
+echo.
+echo ============================================================
+echo [6/9] Compare sample values in one selected time window
+echo ============================================================
+echo.
+
+echo Sample stream: %SampleStreamID%
+echo Sample window: %SampleStart% to %SampleEnd%
+echo.
+
+python .\compare_sds_sample_window.py ^
+  --sds-a "%SDS_result%\obspy" ^
+  --sds-b "%SDS_result%\our" ^
+  --label-a obspy ^
+  --label-b our ^
+  --stream-id "%SampleStreamID%" ^
+  --start "%SampleStart%" ^
+  --end "%SampleEnd%" ^
+  --report "%SampleCompare_report%\obspy_vs_our.json" ^
+  --allow-differences
+
+python .\compare_sds_sample_window.py ^
+  --sds-a "%SDS_result%\obspy" ^
+  --sds-b "%SDS_result%\hybrid" ^
+  --label-a obspy ^
+  --label-b hybrid ^
+  --stream-id "%SampleStreamID%" ^
+  --start "%SampleStart%" ^
+  --end "%SampleEnd%" ^
+  --report "%SampleCompare_report%\obspy_vs_hybrid.json" ^
+  --allow-differences
+
+python .\compare_sds_sample_window.py ^
+  --sds-a "%SDS_result%\obspy" ^
+  --sds-b "%SDS_result%\Any2MSeed.Center" ^
+  --label-a obspy ^
+  --label-b center ^
+  --stream-id "%SampleStreamID%" ^
+  --start "%SampleStart%" ^
+  --end "%SampleEnd%" ^
+  --report "%SampleCompare_report%\obspy_vs_center.json" ^
+  --allow-differences
+
+echo.
+echo ============================================================
+echo [7/9] Create the availability report from the original Y-files
 echo ============================================================
 echo.
 
@@ -64,21 +175,29 @@ python .\yfile_availability_report.py ^
 
 echo.
 echo ============================================================
-echo [6/7] Create availability reports for both SDS archives
+echo [8/9] Create availability reports for SDS archives
 echo ============================================================
 echo.
 
 python .\sds_availability_report.py ^
-  --input "%SDS_obspy%" ^
+  --input "%SDS_result%\obspy" ^
   --output "%Availability_report%\obspy"
 
 python .\sds_availability_report.py ^
-  --input "%SDS_our%" ^
+  --input "%SDS_result%\our" ^
   --output "%Availability_report%\our"
+
+python .\sds_availability_report.py ^
+  --input "%SDS_result%\hybrid" ^
+  --output "%Availability_report%\hybrid"
+
+python .\sds_availability_report.py ^
+  --input "%SDS_result%\Any2MSeed.Center" ^
+  --output "%Availability_report%\center"
 
 echo.
 echo ============================================================
-echo [7/7] Compare the generated availability reports
+echo [9/9] Compare the generated availability reports
 echo ============================================================
 echo.
 
@@ -92,10 +211,27 @@ python .\compare_availability_lines.py ^
   --ours "%Availability_report%\our\availability.txt" ^
   --output "%Availability_report%\yfile-vs-our.txt"
 
+python .\compare_availability_lines.py ^
+  --center "%Availability_report%\center\availability.txt" ^
+  --ours "%Availability_report%\obspy\availability.txt" ^
+  --output "%Availability_report%\center-vs-obspy.txt"
+
+python .\compare_availability_lines.py ^
+  --center "%Availability_report%\center\availability.txt" ^
+  --ours "%Availability_report%\our\availability.txt" ^
+  --output "%Availability_report%\center-vs-our.txt"
+
+python .\compare_availability_lines.py ^
+  --center "%Availability_report%\hybrid\availability.txt" ^
+  --ours "%Availability_report%\obspy\availability.txt" ^
+  --output "%Availability_report%\hybrid-vs-obspy.txt"
+
 echo.
 echo ============================================================
 echo Workflow completed
-echo Results: D:\MSeed_Test\Result\shi201001.month
+echo Results: %SDS_result%
+echo Raw segment reports: %RawSegment_report%
+echo Sample compare reports: %SampleCompare_report%
 echo ============================================================
 echo.
 

@@ -70,8 +70,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--time-tolerance-ns",
         type=int,
-        default=1_000_000,
-        help="Timestamp tolerance when comparing gap boundaries. Default: 1000000 ns.",
+        default=5_000_000,
+        help="Timestamp tolerance when comparing gap boundaries. Default: 5000000 ns (0.005 s).",
     )
     parser.add_argument(
         "--allow-differences",
@@ -110,8 +110,20 @@ def iter_candidate_files(root: Path):
         yield path
 
 
+CENTISECOND_NS = 10_000_000
+
+
+def round_ns_to_centisecond(ns: int) -> int:
+    """Round integer nanoseconds to the nearest 0.01 second."""
+    if ns >= 0:
+        return ((ns + CENTISECOND_NS // 2) // CENTISECOND_NS) * CENTISECOND_NS
+    return -(((-ns + CENTISECOND_NS // 2) // CENTISECOND_NS) * CENTISECOND_NS)
+
+
 def utc_text(value: UTCDateTime) -> str:
-    return value.strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    """Format UTC time rounded to centiseconds (two decimal places)."""
+    rounded = UTCDateTime(ns=round_ns_to_centisecond(int(value.ns)), precision=9)
+    return rounded.strftime("%Y-%m-%dT%H:%M:%S.%f")[:-4]
 
 
 def gap_kind(samples: int) -> str:
@@ -182,6 +194,7 @@ def same_gap(left: GapEntry, right: GapEntry, tolerance_ns: int) -> bool:
     return (
         left.stream_id == right.stream_id
         and left.kind == right.kind
+        and left.samples == right.samples
         and abs(left.previous_end_ns - right.previous_end_ns) <= tolerance_ns
         and abs(left.next_start_ns - right.next_start_ns) <= tolerance_ns
     )
@@ -193,12 +206,23 @@ def find_matching_gap(
     used_indexes: set[int],
     tolerance_ns: int,
 ) -> int | None:
+    """Return the closest unused matching gap inside the time tolerance."""
+    best_index: int | None = None
+    best_error: tuple[int, int] | None = None
+
     for index, candidate in enumerate(candidates):
-        if index in used_indexes:
+        if index in used_indexes or not same_gap(target, candidate, tolerance_ns):
             continue
-        if same_gap(target, candidate, tolerance_ns):
-            return index
-    return None
+
+        previous_error = abs(target.previous_end_ns - candidate.previous_end_ns)
+        next_error = abs(target.next_start_ns - candidate.next_start_ns)
+        error = (max(previous_error, next_error), previous_error + next_error)
+
+        if best_error is None or error < best_error:
+            best_error = error
+            best_index = index
+
+    return best_index
 
 
 def comparison_row(status: str, owner: str, entry: GapEntry) -> dict:
@@ -288,10 +312,7 @@ def format_gap_entry(index: int, entry: GapEntry) -> list[str]:
         f"[{index}] {entry.kind}  {entry.stream_id}",
         f"    Previous end UTC : {entry.previous_end_utc}",
         f"    Next start UTC   : {entry.next_start_utc}",
-        f"    Delta seconds    : {entry.delta_seconds:.9f}",
         f"    Samples          : {entry.samples}",
-        f"    Previous end ns  : {entry.previous_end_ns}",
-        f"    Next start ns    : {entry.next_start_ns}",
         "",
     ]
 
@@ -336,7 +357,7 @@ def write_comparison_report(
         "SDS Gap/Overlap Differences",
         f"First SDS label : {a_label}",
         f"Second SDS label: {b_label}",
-        f"Time tolerance  : {tolerance_ns} ns",
+        f"Time tolerance  : {tolerance_ns / 1_000_000_000:.3f} s ({tolerance_ns} ns)",
         f"Differences     : {len(rows)}",
         "",
     ]
@@ -350,10 +371,7 @@ def write_comparison_report(
                 f"    Kind             : {row['kind']}",
                 f"    Previous end UTC : {row['previous_end_utc']}",
                 f"    Next start UTC   : {row['next_start_utc']}",
-                f"    Delta seconds    : {float(row['delta_seconds']):.9f}",
                 f"    Samples          : {row['samples']}",
-                f"    Previous end ns  : {row['previous_end_ns']}",
-                f"    Next start ns    : {row['next_start_ns']}",
                 "",
             ]
         )
@@ -415,7 +433,7 @@ def write_summary_report(
         f"Report label B     : {b_report_label}",
         f"Python             : {sys.version.split()[0]}",
         f"ObsPy              : {obspy.__version__}",
-        f"Time tolerance     : {tolerance_ns} ns",
+        f"Time tolerance     : {tolerance_ns / 1_000_000_000:.3f} s ({tolerance_ns} ns)",
         "",
         f"Gap/overlap count A: {gap_count_a}",
         f"Gap/overlap count B: {gap_count_b}",

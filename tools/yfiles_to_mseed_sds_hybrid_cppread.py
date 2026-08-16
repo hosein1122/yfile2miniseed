@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -20,10 +21,22 @@ import yfiles_to_mseed_sds_obspy as base
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+REPO_ROOT = SCRIPT_DIR.parent
+PY_BINDINGS_SRC = REPO_ROOT / "python" / "yfile2obspy_cpp" / "src"
 DEFAULT_CORRECT_SID = SCRIPT_DIR / "CorrectSID.txt"
 
 
 BRIDGE_MAGIC = b"Y2OBSBR1\n"
+
+try:
+    import yfile2obspy_cpp
+except ImportError:
+    if PY_BINDINGS_SRC.exists():
+        sys.path.insert(0, str(PY_BINDINGS_SRC))
+    try:
+        import yfile2obspy_cpp
+    except ImportError:
+        yfile2obspy_cpp = None
 
 
 def default_bridge_exe() -> Path:
@@ -36,15 +49,19 @@ def default_bridge_exe() -> Path:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Read Nanometrics Y-files with the C++ bridge, then use ObsPy to "
+            "Read Nanometrics Y-files with the C++ reader, then use ObsPy to "
             "merge, pack, and write strict SDS MiniSEED."
         )
     )
     parser.add_argument("--input-root", required=True, type=Path)
     parser.add_argument("--output-root", required=True, type=Path)
-    parser.add_argument("--bridge-exe", type=Path, default=default_bridge_exe())
+    parser.add_argument(
+        "--bridge-exe",
+        type=Path,
+        default=default_bridge_exe(),
+        help="Compatibility fallback used only when yfile2obspy_cpp is not importable.",
+    )
     parser.add_argument("--network", help="Fallback network if --no-correct-sid is used.")
-    parser.add_argument("--recursive", action="store_true")
     parser.add_argument("--encoding", default="STEIM2", choices=("STEIM1", "STEIM2", "INT32"))
     parser.add_argument("--record-length", type=int, default=4096)
     parser.add_argument("--pattern", default="*")
@@ -132,8 +149,7 @@ def bridge_command(args: argparse.Namespace, input_root: Path) -> list[str]:
         "--pattern",
         args.pattern,
     ]
-    if args.recursive:
-        command.append("--recursive")
+    command.append("--recursive")
     return command
 
 
@@ -274,9 +290,163 @@ def read_stream_from_bridge(
         "files_read": trace_count,
         "plain_files_read": plain_count,
         "zip_members_read": zip_member_count,
+        "rar_members_read": 0,
         "samples_read": sample_count,
         "total_source_bytes": total_source_bytes,
     }
+
+
+def trace_from_cpp_record(record: dict) -> Trace:
+    data = np.asarray(record["samples"], dtype=np.int32)
+    if not data.flags.c_contiguous:
+        data = np.ascontiguousarray(data)
+
+    trace = Trace(data=data)
+    trace.stats.network = str(record.get("network", ""))
+    trace.stats.station = str(record.get("station", ""))
+    trace.stats.location = str(record.get("location", ""))
+    trace.stats.channel = str(record.get("channel", ""))
+    trace.stats.starttime = UTCDateTime(ns=int(record["start_ns"]), precision=9)
+    trace.stats.sampling_rate = float(record["sample_rate"])
+    return trace
+
+
+def read_stream_from_extension(
+    args: argparse.Namespace,
+    input_root: Path,
+    corrections: dict[str, tuple[str, str, str, str]] | None,
+    timings: dict[str, float],
+) -> tuple[Stream, dict[str, int]]:
+    if yfile2obspy_cpp is None:
+        raise RuntimeError("yfile2obspy_cpp is not importable")
+
+    sources = base.iter_input_sources(input_root, args.pattern, True)
+    if not sources:
+        raise RuntimeError(f"no input files matched {args.pattern!r} under {input_root}")
+
+    stream = Stream()
+    sample_count = 0
+    source_bytes_done = 0
+    plain_count = 0
+    zip_member_count = 0
+    rar_member_count = 0
+    total_source_bytes = sum(source.uncompressed_size for source in sources)
+
+    started = time.perf_counter()
+    with base.InputSourceReader() as source_reader:
+        for index, source in enumerate(sources, start=1):
+            stage_started = time.perf_counter()
+            if source.is_archive_member:
+                payload, decompress_elapsed = source_reader.read_archive_payload(source)
+                timings["archive_decompress"] += decompress_elapsed
+                record = yfile2obspy_cpp.read_yfile_bytes(payload)
+                if source.is_zip_member:
+                    zip_member_count += 1
+                elif source.is_rar_member:
+                    rar_member_count += 1
+            else:
+                record = yfile2obspy_cpp.read_yfile_path(str(source.container))
+                plain_count += 1
+            base.add_timing(timings, "cpp_extension_read", stage_started)
+
+            stage_started = time.perf_counter()
+            current = Stream([trace_from_cpp_record(record)])
+            base.add_timing(timings, "cpp_extension_trace_build", stage_started)
+
+            stage_started = time.perf_counter()
+            base.apply_metadata(current, args, source.display_name, corrections)
+            base.add_timing(timings, "metadata_apply", stage_started)
+
+            stage_started = time.perf_counter()
+            stream += current
+            base.add_timing(timings, "stream_append", stage_started)
+
+            npts = int(record["npts"])
+            sample_count += npts
+            source_bytes_done += source.uncompressed_size
+            print_bridge_progress(
+                args,
+                timings,
+                index,
+                len(sources),
+                source_bytes_done,
+                total_source_bytes,
+                f"C++ extension read {source.display_name}",
+            )
+
+    timings["cpp_extension_read_wall"] = time.perf_counter() - started
+    return stream, {
+        "files_read": len(sources),
+        "plain_files_read": plain_count,
+        "zip_members_read": zip_member_count,
+        "rar_members_read": rar_member_count,
+        "samples_read": sample_count,
+        "total_source_bytes": total_source_bytes,
+    }
+
+
+def iter_trace_days(trace: Trace):
+    current = base.day_start(trace.stats.starttime)
+    end_day = base.day_start(trace.stats.endtime)
+    while current <= end_day:
+        yield current
+        current = current + 86400
+
+
+def affected_sds_paths(output_root: Path, stream: Stream) -> set[Path]:
+    paths: set[Path] = set()
+    for trace in stream:
+        for day in iter_trace_days(trace):
+            paths.add(base.sds_path(output_root, trace, day))
+    return paths
+
+
+def load_existing_sds_for_new_data(
+    output_root: Path,
+    new_stream: Stream,
+    timings: dict[str, float],
+) -> tuple[Stream, set[Path], int, int]:
+    paths = affected_sds_paths(output_root, new_stream)
+    existing = Stream()
+    files_read = 0
+    traces_read = 0
+
+    stage_started = time.perf_counter()
+    for path in sorted(paths):
+        if not path.exists():
+            continue
+        part = obspy.read(str(path), format="MSEED", check_compression=False)
+        existing += part
+        files_read += 1
+        traces_read += len(part)
+    base.add_timing(timings, "existing_sds_read", stage_started)
+
+    return existing, paths, files_read, traces_read
+
+
+def replace_staged_sds_files(
+    staging_root: Path,
+    output_root: Path,
+    record_counts: dict[Path, int],
+    timings: dict[str, float],
+) -> int:
+    replaced = 0
+    stage_started = time.perf_counter()
+    for staging_path in sorted(record_counts):
+        relative = staging_path.relative_to(staging_root)
+        final_path = output_root / relative
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+
+        temp_path = final_path.with_name(
+            f"{final_path.name}.tmp-{int(time.time() * 1000)}"
+        )
+        if temp_path.exists():
+            temp_path.unlink()
+        shutil.move(str(staging_path), str(temp_path))
+        temp_path.replace(final_path)
+        replaced += 1
+    base.add_timing(timings, "sds_atomic_replace", stage_started)
+    return replaced
 
 
 def pack_and_write_sds(
@@ -419,6 +589,7 @@ def pack_and_write_sds(
     return {
         "sds_files_written": len(record_counts),
         "records_written": total_records,
+        "record_counts": dict(record_counts),
         "parallel_pack_payload_bytes": (
             sum(len(result.payload) for result in parallel_results)
             if parallel_results is not None
@@ -468,11 +639,15 @@ def finalize_timing_aggregates(
         + timings["sds_close_outputs"]
         + timings["output_validation"]
     )
-    timings["bridge_pipeline_unmeasured"] = max(
+    input_wall = timings["cpp_extension_read_wall"] or timings["bridge_read_wall"]
+    timings["input_reader_pipeline_unmeasured"] = max(
         0.0,
-        timings["bridge_read_wall"]
+        input_wall
         - timings["bridge_payload_read"]
         - timings["bridge_trace_build"]
+        - timings["cpp_extension_read"]
+        - timings["cpp_extension_trace_build"]
+        - timings["archive_decompress"]
         - timings["metadata_apply"]
         - timings["stream_append"]
         - timings["console_progress"],
@@ -495,7 +670,7 @@ def finalize_timing_aggregates(
         "sds_output_total",
         "pack_and_sds_pipeline_wall",
         "bridge_read_wall",
-        "bridge_pipeline_unmeasured",
+        "cpp_extension_read_wall",
         "pack_pipeline_unmeasured",
         "pack_thread_mseed_write_sum",
         "pack_thread_buffer_copy_sum",
@@ -503,6 +678,7 @@ def finalize_timing_aggregates(
         "pack_thread_header_parse_sum",
         "measured_stage_total",
         "unmeasured_overhead",
+        "input_reader_pipeline_unmeasured",
     }
     timings["measured_stage_total"] = sum(
         seconds
@@ -524,6 +700,8 @@ def main() -> int:
         raise RuntimeError(f"input-root does not exist: {input_root}")
     if input_root == output_root:
         raise RuntimeError("input-root and output-root must be different")
+    if output_root.exists() and not output_root.is_dir():
+        raise RuntimeError(f"output-root is not a directory: {output_root}")
     if args.report and output_root in args.report.resolve().parents:
         raise RuntimeError("--report must be outside output-root")
     if args.no_correct_sid and not args.network:
@@ -531,11 +709,14 @@ def main() -> int:
     base.add_timing(timings, "argument_and_path_validation", stage_started)
 
     stage_started = time.perf_counter()
-    base.ensure_empty_output(output_root)
+    output_root.mkdir(parents=True, exist_ok=True)
     base.add_timing(timings, "output_prepare", stage_started)
 
     print(f"Python {sys.version.split()[0]} | ObsPy {obspy.__version__} | NumPy {np.__version__}")
-    print(f"C++ bridge: {args.bridge_exe}")
+    if yfile2obspy_cpp is not None:
+        print("C++ reader: yfile2obspy_cpp native module")
+    else:
+        print(f"C++ reader: bridge fallback {args.bridge_exe}")
 
     stage_started = time.perf_counter()
     corrections = None if args.no_correct_sid else base.load_correct_sid(args.correct_sid.resolve())
@@ -543,9 +724,21 @@ def main() -> int:
     if corrections is not None:
         print(f"Using CorrectSID: {args.correct_sid.resolve()} ({len(corrections)} entries)")
 
-    stream, read_stats = read_stream_from_bridge(args, input_root, corrections, timings)
+    input_decode_mode = "cpp_extension"
+    if yfile2obspy_cpp is not None:
+        stream, read_stats = read_stream_from_extension(args, input_root, corrections, timings)
+    else:
+        input_decode_mode = "cpp_bridge"
+        stream, read_stats = read_stream_from_bridge(args, input_root, corrections, timings)
     if not stream:
-        raise RuntimeError("C++ bridge returned no traces")
+        raise RuntimeError("C++ reader returned no traces")
+
+    new_trace_count = len(stream)
+    existing_stream, touched_paths, existing_files_read, existing_traces_read = (
+        load_existing_sds_for_new_data(output_root, stream, timings)
+    )
+    if existing_stream:
+        stream += existing_stream
 
     stage_started = time.perf_counter()
     stream.sort(keys=["network", "station", "location", "channel", "starttime", "endtime"])
@@ -563,7 +756,16 @@ def main() -> int:
     total_samples = sum(int(trace.stats.npts) for trace in stream)
     base.add_timing(timings, "sample_count", stage_started)
 
-    write_stats, backend_state = pack_and_write_sds(stream, args, output_root, timings)
+    with tempfile.TemporaryDirectory(prefix="yfile_hybrid_sds_stage_") as stage_temp:
+        staging_root = Path(stage_temp)
+        write_stats, backend_state = pack_and_write_sds(stream, args, staging_root, timings)
+        replaced_files = replace_staged_sds_files(
+            staging_root,
+            output_root,
+            write_stats["record_counts"],
+            timings,
+        )
+
     elapsed_seconds = time.perf_counter() - started
     finalize_timing_aggregates(
         timings,
@@ -574,15 +776,20 @@ def main() -> int:
     report = {
         "input_root": str(input_root),
         "output_root": str(output_root),
-        "bridge_exe": str(args.bridge_exe),
+        "bridge_exe": str(args.bridge_exe) if input_decode_mode == "cpp_bridge" else None,
         "obspy": obspy.__version__,
         "numpy": np.__version__,
         "files_read": read_stats["files_read"],
         "plain_files_read": read_stats["plain_files_read"],
         "zip_members_read": read_stats["zip_members_read"],
+        "rar_members_read": read_stats.get("rar_members_read", 0),
         "samples_read": read_stats["samples_read"],
         "total_source_bytes": read_stats["total_source_bytes"],
         "sds_files_written": write_stats["sds_files_written"],
+        "sds_files_replaced": replaced_files,
+        "existing_sds_candidate_files": len(touched_paths),
+        "existing_sds_files_read": existing_files_read,
+        "existing_sds_traces_read": existing_traces_read,
         "records_written": write_stats["records_written"],
         "samples_written": total_samples,
         "encoding": args.encoding,
@@ -592,10 +799,11 @@ def main() -> int:
         "quiet": args.quiet,
         "benchmark": args.benchmark,
         "pack_workers": args.pack_workers,
+        "new_trace_count": new_trace_count,
         "merged_trace_count": len(stream),
         "parallel_pack_payload_bytes": write_stats["parallel_pack_payload_bytes"],
         "pack_execution_mode": write_stats["pack_execution_mode"],
-        "input_decode_mode": "cpp_bridge",
+        "input_decode_mode": input_decode_mode,
         "pack_backend_requested": backend_state.requested,
         "pack_backends_used": sorted(backend_state.used),
         "pack_backend_final": backend_state.active,
@@ -611,11 +819,13 @@ def main() -> int:
         print()
         print("Benchmark timings:")
         benchmark_names = [
+            "cpp_extension_read_wall",
             "bridge_read_wall",
             "merge_method_minus_1",
             "parallel_pack_wall",
             "pack_total",
             "sds_output_total",
+            "sds_atomic_replace",
             "pack_and_sds_pipeline_wall",
             "elapsed_seconds",
         ]
@@ -635,7 +845,7 @@ def main() -> int:
         f"files={report['files_read']}, "
         f"samples={report['samples_written']}, "
         f"records={report['records_written']}, "
-        f"sds_files={report['sds_files_written']}"
+        f"sds_files={report['sds_files_replaced']}"
     )
     if args.report:
         print(f"Report: {args.report}")

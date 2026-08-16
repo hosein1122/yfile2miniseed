@@ -1,187 +1,26 @@
 # yfile2miniseed
 
-`yfile2miniseed` converts Nanometrics Y-File version 5 data into MiniSEED and
-writes the result in an SDS-style folder layout. It can also read existing
-MiniSEED input and rewrite it into the same SDS output tree.
+Fast Nanometrics Y-file tooling for ObsPy and SDS MiniSEED workflows.
 
-The converter intentionally keeps the C++ conversion path simple: it slices data
-into daily MiniSEED files and does not run project-owned overlap cleanup or full
-deduplication. Duplicate handling in this stage is limited to libmseed
-read/repack behavior for adjacent duplicate records. Any deeper overlap cleanup
-or sample-aware deduplication should be done in a separate ObsPy post-processing
-step.
+The recommended product path is the **hybrid converter**:
+
+```text
+Y-file / ZIP / RAR input
+  -> C++ Y-file reader exposed as a Python extension
+  -> ObsPy Stream.sort() + Stream.merge(method=-1)
+  -> strict SDS MiniSEED output
+```
+
+The repository also keeps the direct C++ append converter and comparison tools.
+Those are useful for speed tests, low-level experiments, and regression checks,
+but they are not the preferred final SDS production path when duplicate or
+overlapping Y-file segments may be present.
 
 The main target platform is Windows with Visual Studio/MSVC.
 
-## Quick Start
+## Recommended Quick Start
 
-From a Visual Studio Developer Command Prompt:
-
-```bat
-cd /d D:\C++Code\yfile2miniseed
-if exist out\build\x64-Release rmdir /s /q out\build\x64-Release
-cmake -S . -B out\build\x64-Release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
-cmake --build out\build\x64-Release --config Release
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_sid_scan.exe D:\inputYFiles -o CorrectSID.txt
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\inputYFiles -o D:\OutputStore -V2
-```
-
-Use `-V2` when you need MiniSEED 2 output, for example when validating with
-ObsPy. Without `-V2`, the converter writes MiniSEED 3.
-
-Use `-V2` for any workflow that uses the ObsPy tools in `tools/`, including
-post-conversion duplicate/overlap cleanup. ObsPy's built-in MiniSEED support is
-for MiniSEED 2 on this development setup; MiniSEED 3 requires separate plugin
-support that is not assumed by this project.
-
-## What This Project Does
-
-- Reads Nanometrics Y-File version 5 records.
-- Reads MiniSEED input files as well as Y-Files. For example, you can pass a
-  folder of standalone MiniSEED files and rewrite them into the SDS layout.
-- Scans folders recursively.
-- Reads Y-Files stored inside ZIP archives.
-- Writes MiniSEED output in SDS layout.
-- Builds a `CorrectSID.txt` template from input Y-file headers.
-- Uses libmseed read/repack behavior to skip adjacent duplicate MiniSEED
-  records.
-- Does not perform full deduplication or overlap cleanup in project C++ code.
-- Builds a reusable static library plus a command-line executable.
-
-## Current Conversion Choices
-
-There are two recommended conversion paths in this repository.
-
-### Current C++ Converter
-
-`yfile2mseed_append.exe` is the current C++ operational converter. It reads
-Y-files/ZIP input and writes SDS MiniSEED directly through the project C++ and
-libmseed path:
-
-```bat
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe ^
-  D:\YFiles ^
-  -o D:\SDS_append_cpp ^
-  -V2
-```
-
-This is the fastest path and is the current C++ result to compare against.
-
-### Balanced Hybrid Converter
-
-`yfiles_to_mseed_sds_hybrid_cppread.py` plus `yfile2obspy_bridge.exe` is the
-balanced validation path. The bridge uses the C++ reader for Y-files and ZIP
-members, then Python/ObsPy receives the samples in memory and applies the same
-conservative `Stream.merge(method=-1)`, MiniSEED packing, and SDS writing logic
-as the ObsPy converter.
-
-The bridge executable itself is intentionally a quiet binary backend. Progress
-is printed by the Python hybrid wrapper from the total source byte count reported
-by the bridge.
-
-Build the bridge:
-
-```bat
-cmake --build out\build\x64-Release --target yfile2obspy_bridge --config Release
-```
-
-Run the hybrid converter:
-
-```bat
-python tools\yfiles_to_mseed_sds_hybrid_cppread.py ^
-  --input-root D:\YFiles ^
-  --output-root D:\SDS_hybrid ^
-  --bridge-exe out\build\x64-Release\apps\yfile2mseed_cli\yfile2obspy_bridge.exe ^
-  --correct-sid CorrectSID.txt ^
-  --encoding STEIM2 ^
-  --record-length 4096 ^
-  --pack-workers 4 ^
-  --recursive ^
-  --report D:\SDS_hybrid_report.json
-```
-
-Add `--benchmark` when you want stage timings printed on the console. Without
-`--benchmark`, the Python converters keep console output short and write the
-detailed JSON report to the path passed with `--report`.
-
-### Compare C++ Append And Hybrid Outputs
-
-Use the batch workflow below to build both SDS trees from the same Y-file input,
-run the same ObsPy cleanup on both, and write availability, gap/overlap, archive,
-and optional sample-window comparison reports:
-
-```bat
-tools\compare_append_vs_hybrid_sds.bat ^
-  D:\YFiles ^
-  D:\CompareRuns\append_vs_hybrid ^
-  D:\MSeed_Test\app\CorrectSID.txt
-```
-
-Optional exact sample-window check:
-
-```bat
-tools\compare_append_vs_hybrid_sds.bat ^
-  D:\YFiles ^
-  D:\CompareRuns\append_vs_hybrid ^
-  D:\MSeed_Test\app\CorrectSID.txt ^
-  IR.SHI..BHE ^
-  2010-01-07T00:00:00 ^
-  2010-01-07T00:10:00
-```
-
-Important report files are written under `RESULT_ROOT\reports`.
-
-## Folder Guide
-
-```text
-apps/yfile2mseed_cli/          Command-line application.
-include/yfile2miniseed/        Public library headers.
-include/yfile2miniseed/detail/ Y-File v5 parser internals.
-src/                           Library implementation.
-tools/                         Validation, reporting, and ObsPy cleanup tools.
-docs/                          Development, CI, and maintenance notes.
-tests/                         CTest tests, including ObsPy/STEIM1 validation.
-cmake/modules/                 Local CMake find modules.
-out/                           Local build output. Ignored by git.
-logs/                          Runtime logs. Ignored by git.
-```
-
-Useful files:
-
-```text
-CMakeLists.txt                 Main CMake project.
-apps/yfile2mseed_cli/main.cpp  CLI entry point and argument handling.
-apps/yfile2mseed_cli/sid_inventory_main.cpp
-                               CorrectSID.txt inventory/template builder.
-src/mseed_processor.cpp        MiniSEED write/read, SDS export, libmseed repack.
-src/yfile_reader.cpp           Y-File reader wrapper.
-tools/README.md                Guide to validation and ObsPy cleanup tools.
-tools/sds_obspy_cleanup_inplace.py
-                               In-place SDS cleanup with ObsPy merge(method=-1).
-CorrectSID.txt                 Required local station/channel correction file.
-error_files.txt                Runtime list of files that could not be processed.
-```
-
-`CorrectSID.txt`, `error_files.txt`, `logs/`, and build outputs are intentionally
-ignored by git because they are machine/runtime-specific.
-
-## Build
-
-The project uses CMake and downloads/builds dependencies with `FetchContent`:
-
-- libmseed
-- spdlog
-- zlib
-- libzip
-
-Use a Release build for real conversion work and large datasets. Release is
-optimized and is the recommended build for operational validation. Use Debug
-when changing code, investigating crashes, or stepping through the program in a
-debugger.
-
-### Release Build
-
-Open an `x64 Native Tools Command Prompt for Visual Studio` and run:
+Build the C++ tools:
 
 ```bat
 cd /d D:\C++Code\yfile2miniseed
@@ -189,65 +28,24 @@ cmake -S . -B out\build\x64-Release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_
 cmake --build out\build\x64-Release --config Release
 ```
 
-Use the x64 prompt, not the x86 prompt. If MSVC reports that
-`...\VC\Tools\MSVC\...\lib\x86\libcpmt.lib` conflicts with target machine type
-`x64`, the command prompt environment is wrong or the build directory contains
-stale CMake cache data. Close the prompt, open the x64 Native Tools prompt,
-delete `out\build\x64-Release`, and configure again.
-
-`-DBUILD_TESTING=OFF` is recommended when you only need the converter
-executable. Without it, `cmake --build` also builds test executables.
-
-The Release executable will be here:
-
-```text
-D:\C++Code\yfile2miniseed\out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe
-```
-
-Run the Release test suite:
+Install the Python C++ reader extension:
 
 ```bat
-cd /d D:\C++Code\yfile2miniseed
-ctest --test-dir out\build\x64-Release --output-on-failure
+python -m pip install --upgrade pip setuptools wheel build numpy obspy
+python -m pip install --force-reinstall .\python\yfile2obspy_cpp
 ```
 
-### Debug Build
-
-Use this build when developing or debugging:
+Optional RAR support:
 
 ```bat
-cd /d D:\C++Code\yfile2miniseed
-cmake -S . -B out\build\x64-Debug -DCMAKE_BUILD_TYPE=Debug
-cmake --build out\build\x64-Debug --config Debug
+python -m pip install rarfile
+winget install 7zip.7zip
+setx PATH "%PATH%;C:\Program Files\7-Zip"
 ```
 
-The Debug executable will be here:
+Open a new terminal after changing `PATH`.
 
-```text
-D:\C++Code\yfile2miniseed\out\build\x64-Debug\apps\yfile2mseed_cli\yfile2mseed.exe
-```
-
-Run the Debug test suite:
-
-```bat
-cd /d D:\C++Code\yfile2miniseed
-ctest --test-dir out\build\x64-Debug --output-on-failure
-```
-
-If you see an error like `cannot open file 'kernel32.lib'`, the command was not
-started from the Visual Studio Developer Command Prompt. Start that prompt and
-run the build again.
-
-If you explicitly want to use Ninja, install Ninja or use the one bundled with
-Visual Studio, then add `-G Ninja` to the configure command.
-
-فارسی کوتاه: برای تبدیل واقعی داده‌ها و حجم بالا از Release استفاده کنید. Debug
-برای توسعه و پیدا کردن خطاست و معمولا کندتر اجرا می‌شود.
-
-## Recommended Workflow
-
-0. Choose the input folder that contains Y-files, ZIP files, or MiniSEED files.
-1. Build or update `CorrectSID.txt`, then review it manually:
+Build or update the local SID correction file:
 
 ```bat
 out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_sid_scan.exe ^
@@ -255,164 +53,181 @@ out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_sid_scan.exe ^
   -o CorrectSID.txt
 ```
 
-2. Run the current C++ append converter:
+Create or update an SDS archive with the hybrid converter:
 
 ```bat
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe ^
-  D:\YFiles ^
-  -o D:\SDS ^
-  -V2
-```
-
-3. Run ObsPy cleanup with `merge(method=-1)`:
-
-```bat
-python tools\sds_obspy_cleanup_inplace.py ^
-  --sds-root D:\SDS ^
-  --workers 8 ^
+python tools\yfiles_to_mseed_sds_hybrid_cppread.py ^
+  --input-root D:\YFiles ^
+  --output-root D:\MainSDS ^
+  --correct-sid CorrectSID.txt ^
   --encoding STEIM2 ^
-  --reclen 4096 ^
-  --report D:\SDS_cleanup_report
+  --record-length 4096 ^
+  --pack-workers 4 ^
+  --report D:\MainSDS_hybrid_report.json
 ```
 
-4. Optionally compare against another SDS archive:
+The hybrid converter scans input recursively by default. It reads plain Y-files,
+Y-files inside ZIP archives, and Y-files inside RAR archives. ZIP/RAR members
+are decompressed one member at a time in memory and passed to the C++ reader with
+no extraction directory.
 
-```bat
-python tools\compare_mseed_outputs.py ^
-  --reference D:\ExistingSDS ^
-  --candidate D:\SDS ^
-  --report D:\SDS_compare_report ^
-  --level medium ^
-  --id-mode strict
+## What To Trust For Final SDS
+
+Use `tools/yfiles_to_mseed_sds_hybrid_cppread.py` as the primary SDS builder.
+It keeps the fast project C++ Y-file decoder, then lets ObsPy do the conservative
+merge and MiniSEED writing work.
+
+Use `apps/yfile2mseed_cli/yfile2mseed_append.exe` as a direct C++ append tool,
+benchmark target, or diagnostic path. It appends packed MiniSEED records into
+daily SDS files and intentionally does not implement project-owned sample
+deduplication or overlap rewriting.
+
+Important limitation: ObsPy `merge(method=-1)` is conservative. It is reliable
+for compatible overlaps and exact data continuity, but it is not a force-delete
+policy for every possible duplicate that already exists inside an SDS archive.
+For fully idempotent production ingestion, keep an external manifest/ingest log
+so the same source file is not submitted again.
+
+## Python Y-file Reader
+
+The package in `python/yfile2obspy_cpp` exposes the C++ Y-file reader to Python:
+
+```python
+import yfile2obspy_cpp
+
+record = yfile2obspy_cpp.read_yfile_path(r"D:\YFiles\YPARSPE.20100107.095933")
+record = yfile2obspy_cpp.read_yfile_bytes(payload_from_zip_or_rar)
 ```
 
-## Run The C++ Converter
+Returned records contain metadata plus a NumPy `int32` sample array:
+
+```text
+network, station, location, channel, start_ns, end_ns,
+sample_rate, npts, samples
+```
+
+This package is intentionally small. Archive discovery, SID correction, ObsPy
+merge, MiniSEED packing, SDS routing, and existing-SDS update logic live in the
+Python tools.
+
+## Existing SDS Updates
+
+When `--output-root` already contains SDS files, the hybrid converter reads only
+the SDS files affected by the new input, combines existing traces with the new
+Y-file traces, sorts, runs `Stream.merge(method=-1)`, writes to a staging
+directory, and replaces the touched SDS files.
+
+This usually produces much cleaner reruns than direct append. It is still not a
+substitute for a source-file manifest because previously packed SDS trace
+boundaries can differ from the original Y-file trace boundaries.
+
+## C++ Append Tool
 
 General form:
 
 ```bat
-yfile2mseed_append.exe inputPath [-o outputDir] [-R minRamGb] [-V2] [-h]
+yfile2mseed_append.exe inputPath [-o outputDir] [-R minRamGb] [-V2] [--workers N] [-h]
 ```
 
 Examples:
 
 ```bat
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\YFiles -o D:\SDS
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\YFiles -o D:\SDS -V2
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\one_file.mseed -o D:\SDS -V2
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\LooseMSeedFiles -o D:\SDS -V2
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\YFiles -o D:\SDS_append -V2 --workers 4
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe D:\one_file.mseed -o D:\SDS_append -V2
 ```
 
-Arguments:
+Use `-V2` for workflows that will be read by the included ObsPy tools. Without
+`-V2`, the C++ converter writes MiniSEED 3.
 
-```text
-inputPath      Input folder or single file.
--o outputDir   Output SDS root. Default: OutPutStore
--R minRamGb    Approximate RAM threshold before flushing data. Default: 2
--V2            Write MiniSEED 2 instead of MiniSEED 3. Recommended before
-               running ObsPy tools.
--h             Show help.
-```
+## Validation And Benchmarks
 
-The output path uses SDS-style folders:
-
-```text
-outputRoot/YYYY/NET/STA/CHA.D/NET.STA.LOC.CHA.D.YYYY.DDD.mseed
-```
-
-Example:
-
-```text
-D:\SDS\2020\IR\TST\BHZ.D\IR.TST..BHZ.D.2020.001.mseed
-```
-
-## ObsPy SDS Cleanup
-
-After conversion, use `tools/sds_obspy_cleanup_inplace.py` when you want ObsPy
-to remove compatible duplicates and safe overlaps in the SDS archive itself:
+Compare append, ObsPy, and hybrid output across many input folders:
 
 ```bat
-python tools\sds_obspy_cleanup_inplace.py ^
-  --sds-root D:\SDS ^
-  --workers 8 ^
-  --encoding STEIM2 ^
-  --reclen 4096 ^
-  --report D:\SDS_cleanup_report
+python tools\run_raw_sds_matrix_5cases.py ^
+  --data-root D:\MSeed_Test\Data ^
+  --result-root D:\MSeed_Test\Result\raw_sds_matrix ^
+  --limit 14
 ```
 
-Start with `--dry-run` on a new dataset. The cleanup tool rewrites files in
-place; it does not copy the SDS tree to a different output folder. Use
-`--backup-suffix .bak` if you want original files preserved next to the cleaned
-files.
-
-This tool uses ObsPy `Stream.merge(method=-1)`, which is conservative. It does
-not force conflicting overlap sample values into a single trace. For this
-workflow, generate MiniSEED 2 with `-V2`; plain ObsPy does not handle MiniSEED 3
-in this project setup.
-
-## Compare Two SDS Archives
-
-Use `tools/compare_mseed_outputs.py` when you want to compare two SDS folders,
-for example one generated by this project and another generated by a different
-program:
+Benchmark repeated ingestion into an existing SDS:
 
 ```bat
-python tools\compare_mseed_outputs.py ^
-  --reference D:\ExistingSDS ^
-  --candidate D:\OurSDS ^
-  --report D:\SDS_compare_report ^
-  --level medium ^
-  --id-mode strict
+python tools\benchmark_append_vs_hybrid_existing_sds.py ^
+  --input-root D:\MSeed_Test\Data\shi201001.month ^
+  --result-root D:\MSeed_Test\Result\shi201001_benchmark ^
+  --iterations 5
 ```
 
-For a smaller subset, use `--level deep`. Deep comparison reads sample data and
-compares ObsPy-cleaned streams using `Stream.merge(method=-1)`:
+Compare two existing SDS archives:
 
 ```bat
-python tools\compare_mseed_outputs.py ^
-  --reference D:\ExistingSDS ^
-  --candidate D:\OurSDS ^
-  --report D:\SDS_compare_deep ^
-  --level deep ^
-  --station TST ^
-  --max-deep-samples 2000000
-```
-
-The report folder contains:
-
-```text
-comparison_summary.csv
-comparison_summary.json
-mismatches.txt
+python tools\compare_sds_gaps.py ^
+  --sds-a D:\ReferenceSDS ^
+  --sds-b D:\CandidateSDS ^
+  --a-label reference ^
+  --b-label candidate ^
+  --report D:\SDS_gap_compare ^
+  --allow-differences
 ```
 
 See [tools/README.md](tools/README.md) for the full tools guide.
 
-## CorrectSID.txt
-
-The converter uses `CorrectSID.txt` for local source identifier corrections.
-Run `yfile2mseed_sid_scan` before conversion to build a template from the input
-Y-file headers. Existing entries are preserved, so you can safely rerun the scan
-after adding new input files.
-
-Each line maps the raw SID fields from the input file to the corrected values:
+## Folder Guide
 
 ```text
-RAWNET_RAWSTA_RAWLOC_RAWCHA => NET_STA_LOC_CHA
+apps/yfile2mseed_cli/          C++ command-line tools.
+include/yfile2miniseed/        Public C++ library headers.
+src/                           C++ library implementation.
+python/yfile2obspy_cpp/        Python extension wrapping the C++ Y-file reader.
+tools/                         Hybrid converter, ObsPy builders, reports, benchmarks.
+docs/                          Development, CI, and release notes.
+tests/                         CTest and ObsPy validation tests.
+out/                           Local build output. Ignored by git.
+logs/                          Runtime logs. Ignored by git.
 ```
 
-The converter no longer waits for keyboard input when it sees a new SID. If
-`CorrectSID.txt` is missing, empty, or does not contain a needed mapping, it
-prints an error and stops. This prevents long unattended runs from silently
-waiting for user input.
+Useful files:
 
-The file is ignored by git because it is local/operator-specific.
+```text
+tools/yfiles_to_mseed_sds_hybrid_cppread.py  Primary SDS builder.
+tools/yfiles_to_mseed_sds_obspy.py           Pure Python/ObsPy reference builder.
+tools/sds_obspy_cleanup_inplace.py           Conservative in-place SDS cleanup.
+tools/sds_raw_segment_report.py              Raw MiniSEED record segment report.
+tools/sds_availability_report.py             SDS availability report.
+CorrectSID.txt                               Local SID correction file.
+```
+
+`CorrectSID.txt`, runtime logs, build outputs, and generated SDS results are
+local/operator-specific and should not be committed.
+
+## Build Notes
+
+Use a Release build for real conversion work and large datasets:
+
+```bat
+cd /d D:\C++Code\yfile2miniseed
+cmake -S . -B out\build\x64-Release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build out\build\x64-Release --config Release
+```
+
+Run tests:
+
+```bat
+ctest --test-dir out\build\x64-Release --output-on-failure
+```
+
+Use an x64 Visual Studio Developer Command Prompt. If MSVC reports x86/x64
+library conflicts, reopen the x64 prompt, delete the stale build directory, and
+configure again.
 
 ## More Documentation
 
-- [tools/README.md](tools/README.md): validation, comparison, and ObsPy cleanup
-  tools.
-- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): tests, CI, release packaging, and
+- [tools/README.md](tools/README.md): hybrid converter, reports, comparisons,
+  and benchmark workflows.
+- [python/yfile2obspy_cpp/README.md](python/yfile2obspy_cpp/README.md): Python
+  extension install and API notes.
+- [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md): tests, CI, releases, and
   maintenance notes.
 
 ## License

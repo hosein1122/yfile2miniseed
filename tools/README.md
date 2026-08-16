@@ -1,288 +1,202 @@
 # Tools Guide
 
-The files in this folder are still useful, but they now have clearer roles:
-the C++ converter writes daily SDS MiniSEED, while ObsPy-based tools are used
-for validation and post-processing.
-
-## Recommended Conversion And Cleanup Flow
-
-Use MiniSEED 2 output when you plan to run the ObsPy tools:
-
-```bat
-out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed.exe ^
-  D:\YFiles ^
-  -o D:\SDS ^
-  -V2
-```
-
-ObsPy's built-in MiniSEED support targets MiniSEED 2. MiniSEED 3 support is not
-part of the normal ObsPy MiniSEED path on this development setup, so write `-V2`
-before using these tools unless you have installed and tested a separate
-MiniSEED 3 ObsPy plugin.
-
-After conversion, run conservative in-place cleanup:
-
-```bat
-python tools\sds_obspy_cleanup_inplace.py ^
-  --sds-root D:\SDS ^
-  --workers 8 ^
-  --encoding STEIM2 ^
-  --reclen 4096 ^
-  --report D:\SDS_cleanup_report
-```
-
-This rewrites the SDS files in the same location. Use `--dry-run` first if you
-only want to inspect what would be processed, or `--backup-suffix .bak` if you
-want a copy of each original file before replacement.
-
-Start with a dry run for new datasets:
-
-```bat
-python tools\sds_obspy_cleanup_inplace.py ^
-  --sds-root D:\SDS ^
-  --workers 8 ^
-  --dry-run ^
-  --report D:\SDS_cleanup_dry_run
-```
-
-## Tool Inventory
+The main user-facing converter in this folder is:
 
 ```text
-sds_obspy_cleanup_inplace.py  Post-process a standard SDS tree in place with
-                              ObsPy Stream.merge(method=-1).
-
-sds_availability_report.py  Build availability reports from MiniSEED/SDS.
-                              This is a reporting tool, not a cleanup tool.
-                              Its normalized report uses ObsPy method=-1.
-
-sds_raw_segment_report.py   Build a TXT report from raw MiniSEED records in an
-                              SDS tree without merging traces.
-
 yfiles_to_mseed_sds_hybrid_cppread.py
-                              Use the C++ Y-file reader bridge, then reuse the
-                              ObsPy merge/pack/SDS path.
-
-compare_append_vs_hybrid_sds.bat
-                              Build SDS with yfile2mseed_append.exe and the
-                              hybrid converter, then compare the two outputs.
-
-yfile_availability_report.py  Build availability reports from raw Y-file input
-                              using Nanometrics Y5DUMP headers.
-
-compare_mseed_outputs.py      Compare two MiniSEED/SDS trees at header,
-                              coverage, or sample level. Deep comparison uses
-                              ObsPy Stream.merge(method=-1).
-
-compare_sds_gaps.py           Save ordered gap/overlap lists for two SDS trees
-                              and compare the two lists using ObsPy get_gaps().
-
-compare_sds_sample_window.py  Fast sample-by-sample comparison for one NSLC
-                              stream and one short time window.
-
-compare_availability_lines.py Compare two generated availability text reports
-                              line by line.
-
-run_full_availability_case.bat
-                              Local lab workflow for comparing yfile2miniseed
-                              with another converter in one specific setup.
-
-compare_sds_availability.bat  Build availability reports for two existing SDS
-                              folders and compare the reports line by line.
-
-availability_report_tools.md  Older Persian notes for the availability report
-                              workflow.
-
-compare_mseed_outputs.md      Guide for comparing two arbitrary SDS archives.
 ```
 
-See [compare_mseed_outputs.md](compare_mseed_outputs.md) for comparison examples
-and report meanings.
+It reads Y-files with the project C++ reader exposed as the Python package
+`yfile2obspy_cpp`, then uses ObsPy for sorting, conservative
+`Stream.merge(method=-1)`, MiniSEED packing, and SDS routing.
 
-## Compare SDS Gaps
+## Primary Hybrid Converter
 
-Use `compare_sds_gaps.py` when you only want the gaps/overlaps in two SDS trees:
+Install the native reader once:
 
 ```bat
-python tools\compare_sds_gaps.py ^
-  --sds-a D:\ReferenceSDS ^
-  --sds-b D:\OurSDS ^
-  --a-label reference ^
-  --b-label ours ^
-  --report D:\SDS_gap_compare
+cd /d D:\C++Code\yfile2miniseed
+python -m pip install --upgrade pip setuptools wheel build numpy obspy
+python -m pip install --force-reinstall .\python\yfile2obspy_cpp
 ```
 
-The tool reads MiniSEED headers with ObsPy, sorts traces by stream and time, and
-uses `Stream.get_gaps()`. It writes the full ordered gap/overlap list for each
-SDS tree, then writes only differences to the final comparison CSV:
-
-```text
-gaps_reference.csv
-gaps_ours.csv
-gap_comparison.csv
-report.json
-```
-
-`gap_comparison.csv` contains only gaps/overlaps that exist in one SDS tree but
-not the other. A gap is considered shared when stream id, gap/overlap kind, start
-boundary, and end boundary match within `--time-tolerance-ns`.
-
-Use `--station KAZ` or `--channel SPE` to limit the comparison.
-
-## Raw SDS Segment Report
-
-Use `sds_raw_segment_report.py` when you want to inspect what is stored inside
-one SDS tree without ObsPy trace merging:
-
-```bat
-python tools\sds_raw_segment_report.py ^
-  --input D:\SDS ^
-  --output D:\SDS_raw_segments.txt ^
-  --station SHI ^
-  --channel BHE
-```
-
-The report is built from MiniSEED record headers. Consecutive records are kept
-as one segment only while their times are contiguous and their MiniSEED2 sequence
-numbers continue. If a converter appended a new packed Y-file with sequence
-numbers starting again, the report starts a new segment even when there is no
-time gap.
-
-## Hybrid C++ Read And ObsPy Write
-
-Use `yfiles_to_mseed_sds_hybrid_cppread.py` when you want the C++ Y-file/ZIP
-reader speed but the same ObsPy merge and SDS writing logic as
-`yfiles_to_mseed_sds_obspy.py`:
+Run:
 
 ```bat
 python tools\yfiles_to_mseed_sds_hybrid_cppread.py ^
   --input-root D:\YFiles ^
-  --output-root D:\SDS_hybrid ^
-  --bridge-exe out\build\x64-Release\apps\yfile2mseed_cli\yfile2obspy_bridge.exe ^
-  --correct-sid D:\MSeed_Test\app\CorrectSID.txt ^
+  --output-root D:\MainSDS ^
+  --correct-sid D:\C++Code\yfile2miniseed\CorrectSID.txt ^
   --encoding STEIM2 ^
   --record-length 4096 ^
   --pack-workers 4 ^
   --quiet ^
-  --report D:\SDS_hybrid_report.json ^
+  --report D:\MainSDS_hybrid_report.json
+```
+
+Notes:
+
+- Input scanning is recursive by default.
+- Existing SDS files under `--output-root` are considered automatically for
+  affected station/day/channel paths.
+- Plain Y-files, ZIP archives, and RAR archives are supported.
+- ZIP/RAR members are decompressed one member at a time in memory.
+- RAR support requires `rarfile` plus an installed backend such as 7-Zip.
+- `yfile2obspy_bridge.exe` remains only as a compatibility fallback when the
+  Python extension is not importable.
+
+Optional RAR setup:
+
+```bat
+python -m pip install rarfile
+winget install 7zip.7zip
+setx PATH "%PATH%;C:\Program Files\7-Zip"
+```
+
+Open a new terminal after changing `PATH`.
+
+## Pure ObsPy Reference Builder
+
+Use `yfiles_to_mseed_sds_obspy.py` when you want a reference path that reads
+Y-files through ObsPy/Python instead of the C++ extension:
+
+```bat
+python tools\yfiles_to_mseed_sds_obspy.py ^
+  --input-root D:\YFiles ^
+  --output-root D:\ReferenceSDS ^
   --recursive
 ```
 
-Build the bridge target first:
+This tool is useful as a baseline. It is usually slower than the hybrid path.
+
+## Direct C++ Append Tool
+
+`yfile2mseed_append.exe` is kept for direct C++ output, benchmarks, and
+diagnostics:
 
 ```bat
-cmake --build out\build\x64-Release --target yfile2obspy_bridge --config Release
-```
-
-The bridge executable is a quiet binary backend. It does not print a progress
-bar by itself; the Python hybrid wrapper prints conversion progress from the
-input byte totals reported by the bridge. Add `--benchmark` only when you want
-selected timings printed on the console.
-
-## Compare Append C++ And Hybrid C++/ObsPy
-
-Use `compare_append_vs_hybrid_sds.bat` when you want one command that takes a
-Y-file folder, creates SDS output with both recommended methods, and shows where
-the two results differ:
-
-```bat
-tools\compare_append_vs_hybrid_sds.bat ^
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_append.exe ^
   D:\YFiles ^
-  D:\CompareRuns\append_vs_hybrid ^
-  D:\MSeed_Test\app\CorrectSID.txt
+  -o D:\SDS_append ^
+  -V2 ^
+  --workers 4
 ```
 
-The batch file writes:
+It appends records into SDS files. It intentionally does not implement custom
+sample deduplication or overlap rewriting. Prefer the hybrid converter for final
+SDS generation when duplicate/overlap behavior matters.
+
+## Existing SDS Behavior
+
+Hybrid updates are designed for a destination that may already contain SDS data:
 
 ```text
-append_cpp\                         SDS from yfile2mseed_append.exe
-hybrid_cppread_obspy\               SDS from the C++ bridge + ObsPy path
-reports\append_raw_segments.txt     MiniSEED record segments without merging
-reports\hybrid_raw_segments.txt     MiniSEED record segments without merging
-reports\availability_diff_append_vs_hybrid.txt
-reports\gap_compare\gap_comparison.csv
-reports\archive_compare\comparison_summary.json
+read new Y-file traces
+read affected existing SDS files
+sort by stream/time
+ObsPy merge(method=-1)
+write staged SDS files
+replace touched output files
 ```
 
-You can also add one exact sample-window comparison at the end of the command:
+This is cleaner than direct append for repeated runs, but it is still not a
+guarantee that rerunning the same source files will be perfectly idempotent.
+For production ingestion, keep a manifest of already-ingested source files and
+skip them before conversion.
+
+## Reports And Comparisons
+
+Raw MiniSEED record segments:
 
 ```bat
-tools\compare_append_vs_hybrid_sds.bat ^
-  D:\YFiles ^
-  D:\CompareRuns\append_vs_hybrid ^
-  D:\MSeed_Test\app\CorrectSID.txt ^
-  IR.SHI..BHE ^
-  2010-01-07T00:00:00 ^
-  2010-01-07T00:10:00
+python tools\sds_raw_segment_report.py ^
+  --input D:\MainSDS ^
+  --output D:\Reports\raw_segments.txt ^
+  --no-split-on-sequence-reset
 ```
 
-## Compare One Sample Window
+Availability:
 
-Use `compare_sds_sample_window.py` when you want a quick exact check for one
-station component instead of comparing a complete SDS archive:
+```bat
+python tools\sds_availability_report.py ^
+  --input D:\MainSDS ^
+  --output D:\Reports\availability
+```
+
+Availability diff:
+
+```bat
+python tools\compare_availability_lines.py ^
+  --center D:\Reports\availability_a\availability.txt ^
+  --ours D:\Reports\availability_b\availability.txt ^
+  --output D:\Reports\availability_diff.txt
+```
+
+Gap/overlap comparison:
+
+```bat
+python tools\compare_sds_gaps.py ^
+  --sds-a D:\ReferenceSDS ^
+  --sds-b D:\MainSDS ^
+  --a-label reference ^
+  --b-label hybrid ^
+  --report D:\Reports\gap_compare ^
+  --allow-differences
+```
+
+Sample-window comparison:
 
 ```bat
 python tools\compare_sds_sample_window.py ^
-  --sds-a D:\Bench\obspy ^
-  --sds-b D:\Bench\cpp ^
-  --label-a obspy ^
-  --label-b cpp ^
-  --stream-id IR.TST..BHZ ^
-  --start 2020-01-01T00:00:00 ^
+  --sds-a D:\ReferenceSDS ^
+  --sds-b D:\MainSDS ^
+  --label-a reference ^
+  --label-b hybrid ^
+  --stream-id IR.SHI..BHE ^
+  --start 2010-01-07T00:00:00 ^
   --duration-seconds 30 ^
-  --report D:\Bench\sample_window_compare.json
+  --report D:\Reports\sample_window_compare.json ^
+  --allow-differences
 ```
 
-The tool reads only that SDS stream and the half-open time window
-`start <= sample_time < end`, aligns samples on the requested start-time grid,
-then reports samples that exist on only one side and samples whose values
-differ. Use `--max-diffs` to control how many individual differences are
-printed.
+## Benchmark Workflows
 
-## In-Place SDS Cleanup Details
-
-`sds_obspy_cleanup_inplace.py` assumes this SDS layout:
-
-```text
-SDS_ROOT/YEAR/NET/STA/CHAN.TYPE/NET.STA.LOC.CHAN.TYPE.YEAR.DOY[.mseed]
-```
-
-It does not scan all headers before building work. It parses metadata from the
-SDS path, groups files by:
-
-```text
-Network + Station + Year + DayOfYear
-```
-
-Then each worker:
-
-1. Reads all waveform channel files for that station-day.
-2. Validates that every loaded trace matches the NSLC claimed by its SDS path.
-3. Runs `Stream.merge(method=-1)`.
-4. Writes each cleaned NSLC stream back to the same SDS file, using a temporary
-   file in the same folder and then replacing the original file.
-
-`method=-1` is ObsPy's conservative cleanup merge. It can remove compatible
-duplicates and safe overlaps, but it is not a force-merge for conflicting
-overlap sample values. Conflicts are left for review instead of being silently
-filled or overwritten.
-
-For safer first runs, use:
+Append vs hybrid repeated-ingestion benchmark:
 
 ```bat
-python tools\sds_obspy_cleanup_inplace.py ^
-  --sds-root D:\SDS ^
-  --dry-run ^
-  --report D:\SDS_cleanup_dry_run
+python tools\benchmark_append_vs_hybrid_existing_sds.py ^
+  --input-root D:\MSeed_Test\Data\shi201001.month ^
+  --result-root D:\MSeed_Test\Result\shi201001_benchmark ^
+  --iterations 5
 ```
 
-For an in-place run with original-file backups:
+Matrix comparison across several input folders:
 
 ```bat
-python tools\sds_obspy_cleanup_inplace.py ^
-  --sds-root D:\SDS ^
-  --backup-suffix .bak ^
-  --report D:\SDS_cleanup_report
+python tools\run_raw_sds_matrix_5cases.py ^
+  --data-root D:\MSeed_Test\Data ^
+  --result-root D:\MSeed_Test\Result\raw_sds_matrix ^
+  --limit 14
 ```
 
-Backups stay next to the original files and are not part of the SDS cleanup
-output.
+Despite the historical filename, `run_raw_sds_matrix_5cases.py` accepts any
+limit and repeatable `--case` arguments.
+
+## Tool Inventory
+
+```text
+yfiles_to_mseed_sds_hybrid_cppread.py  Primary hybrid SDS builder.
+yfiles_to_mseed_sds_obspy.py           Pure ObsPy reference SDS builder.
+sds_obspy_cleanup_inplace.py           Conservative in-place SDS cleanup.
+sds_availability_report.py             Availability reports from SDS.
+sds_raw_segment_report.py              Raw MiniSEED record segment report.
+compare_availability_lines.py          Compare availability TXT reports.
+compare_sds_gaps.py                    Compare ObsPy gap/overlap lists.
+compare_sds_sample_window.py           Compare one exact sample window.
+compare_mseed_outputs.py               Compare two MiniSEED/SDS trees.
+benchmark_append_vs_hybrid_existing_sds.py
+                                      Benchmark append vs hybrid reruns.
+run_raw_sds_matrix_5cases.py           Multi-folder fresh/existing comparison.
+compare_append_vs_hybrid_sds.bat       Legacy local comparison wrapper.
+availability_report_tools.md           Older availability notes.
+```

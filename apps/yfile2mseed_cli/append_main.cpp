@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -22,17 +23,47 @@ namespace {
 
 bool miniSeedVersion3 = true;
 
+using SteadyClock = std::chrono::steady_clock;
+
+double elapsed_seconds(SteadyClock::time_point start)
+{
+	return std::chrono::duration<double>(SteadyClock::now() - start).count();
+}
+
+struct CliBenchmarkStats {
+	double collectFilesSeconds = 0.0;
+	double zipValidateSeconds = 0.0;
+	double zipExtractSeconds = 0.0;
+	double yReadRamSeconds = 0.0;
+	double yReadFileSeconds = 0.0;
+	double sidCorrectionSeconds = 0.0;
+	double appendYFileSeconds = 0.0;
+	double statsUpdateSeconds = 0.0;
+	double flushSeconds = 0.0;
+	double finalizeSeconds = 0.0;
+	double writeStatsSeconds = 0.0;
+	uint64_t zipFiles = 0;
+	uint64_t zipItems = 0;
+	uint64_t zipExtractedBytes = 0;
+	uint64_t ramYFilesRead = 0;
+	uint64_t fileYFilesRead = 0;
+};
+
 bool flush_pending_writers(
 	yfile2miniseed::MSeedProcessor& processor,
-	size_t& totalRamSampleNum)
+	CliBenchmarkStats* benchmarkStats = nullptr)
 {
+	const auto started = SteadyClock::now();
 	if (!processor.ClosePendingWriters())
 	{
+		if (benchmarkStats)
+			benchmarkStats->flushSeconds += elapsed_seconds(started);
 		spdlog::error("Pending MiniSEED writer flush failed.");
 		return false;
 	}
+	if (benchmarkStats)
+		benchmarkStats->flushSeconds += elapsed_seconds(started);
 
-	totalRamSampleNum = 0;
 	return true;
 }
 
@@ -40,16 +71,18 @@ bool append_current_yfile(
 	yfile2miniseed::Y5FileReader& reader,
 	yfile2miniseed::MSeedProcessor& processor,
 	yfile2miniseed::cli::sid::SIDCorrector& sidCorrector,
-	size_t& totalRamSampleNum,
-	size_t minRamInt)
+	CliBenchmarkStats* benchmarkStats = nullptr)
 {
 	yfile2miniseed::cli::sid::SIDCorrector::CorrectedEntry corrected;
+	const auto sidStarted = SteadyClock::now();
 	const bool ok = sidCorrector.GetCorrected(
 		reinterpret_cast<const char*>(reader.t1.NetworkID),
 		reinterpret_cast<const char*>(reader.t1.StationID.Station),
 		reinterpret_cast<const char*>(reader.t1.StationID.Location),
 		reinterpret_cast<const char*>(reader.t1.StationID.Channel),
 		corrected);
+	if (benchmarkStats)
+		benchmarkStats->sidCorrectionSeconds += elapsed_seconds(sidStarted);
 
 	if (!ok)
 	{
@@ -72,6 +105,7 @@ bool append_current_yfile(
 	if (sid == "FDSN:___")
 		return false;
 
+	const auto appendStarted = SteadyClock::now();
 	if (!processor.AppendYFileToPendingSession(
 		sid.c_str(),
 		reader.t7.samples,
@@ -80,21 +114,20 @@ bool append_current_yfile(
 		static_cast<double>(reader.t3.SampleRate),
 		miniSeedVersion3))
 	{
+		if (benchmarkStats)
+			benchmarkStats->appendYFileSeconds += elapsed_seconds(appendStarted);
 		return false;
 	}
+	if (benchmarkStats)
+		benchmarkStats->appendYFileSeconds += elapsed_seconds(appendStarted);
 
+	const auto statsStarted = SteadyClock::now();
 	yfile2miniseed::cli::stats::checkNewData(
 		sid,
 		{ reader.t5.StartTime, reader.t5.EndTime },
 		reader.t3.SampleRate);
-
-	totalRamSampleNum += reader.t5.NumSamples;
-	if (totalRamSampleNum > (minRamInt * 184'000'000ULL))
-	{
-		spdlog::info("RAM limit reached. Flushing pending MiniSEED writers...");
-		if (!flush_pending_writers(processor, totalRamSampleNum))
-			return false;
-	}
+	if (benchmarkStats)
+		benchmarkStats->statsUpdateSeconds += elapsed_seconds(statsStarted);
 
 	return true;
 }
@@ -123,14 +156,48 @@ void print_usage()
 {
 	std::cout
 		<< "usage:\n"
-		<< "\tyfile2mseed_append inputPath [-o outputDir] [-R MinRAM] [-V2] [--sort-dedup]\n"
+		<< "\tyfile2mseed_append inputPath [-o outputDir] [-V2] [--sort-dedup] [--benchmark] [--workers N]\n"
 		<< "\n"
 		<< "\tinputPath      Input directory or file containing Y-Files or ZIPs\n"
 		<< "\t-o outputDir   Output SDS root. Default: OutPutStore\n"
-		<< "\t-R MinRAM      Flush pending writers after this rough RAM threshold. Default: 2\n"
 		<< "\t-V2            Write MiniSEED version 2 instead of version 3\n"
 		<< "\t--sort-dedup   After append, rewrite changed SDS files once for sorting and once for duplicate removal\n"
+		<< "\t--benchmark    Print stage-level timing statistics\n"
+		<< "\t--workers N    Parallel SDS finalize workers. Default: 1\n"
 		<< "\t-h             Show help\n";
+}
+
+void print_benchmark(
+	const CliBenchmarkStats& cliStats,
+	const yfile2miniseed::MSeedProcessor::AppendSessionStats& processorStats)
+{
+	const double pendingMb = static_cast<double>(processorStats.pendingBytes) / (1024.0 * 1024.0);
+	const double zipMb = static_cast<double>(cliStats.zipExtractedBytes) / (1024.0 * 1024.0);
+
+	spdlog::info("==================================================");
+	spdlog::info("Append Benchmark");
+	spdlog::info("==================================================");
+	spdlog::info("CLI collect files        : {:.6f} sec", cliStats.collectFilesSeconds);
+	spdlog::info("CLI zip validate         : {:.6f} sec", cliStats.zipValidateSeconds);
+	spdlog::info("CLI zip extract          : {:.6f} sec ({} items, {:.2f} MiB)", cliStats.zipExtractSeconds, cliStats.zipItems, zipMb);
+	spdlog::info("CLI Y read from RAM      : {:.6f} sec ({} files)", cliStats.yReadRamSeconds, cliStats.ramYFilesRead);
+	spdlog::info("CLI Y read from file     : {:.6f} sec ({} files)", cliStats.yReadFileSeconds, cliStats.fileYFilesRead);
+	spdlog::info("CLI SID correction       : {:.6f} sec", cliStats.sidCorrectionSeconds);
+	spdlog::info("CLI append YFile         : {:.6f} sec", cliStats.appendYFileSeconds);
+	spdlog::info("CLI availability stats   : {:.6f} sec", cliStats.statsUpdateSeconds);
+	spdlog::info("CLI close/flush writers  : {:.6f} sec", cliStats.flushSeconds);
+	spdlog::info("CLI finalize session     : {:.6f} sec", cliStats.finalizeSeconds);
+	spdlog::info("CLI write stats report   : {:.6f} sec", cliStats.writeStatsSeconds);
+	spdlog::info("Processor pack           : {:.6f} sec ({} records)", processorStats.packSeconds, processorStats.packedRecords);
+	spdlog::info("Processor route records  : {:.6f} sec", processorStats.recordRouteSeconds);
+	spdlog::info("Processor pending open   : {:.6f} sec ({} files)", processorStats.pendingOpenSeconds, processorStats.pendingFiles);
+	spdlog::info("Processor pending write  : {:.6f} sec ({} records, {:.2f} MiB)", processorStats.pendingWriteSeconds, processorStats.pendingRecords, pendingMb);
+	spdlog::info("Processor pending close  : {:.6f} sec", processorStats.pendingCloseSeconds);
+	spdlog::info("Processor validate       : {:.6f} sec ({} validations)", processorStats.validateSeconds, processorStats.validations);
+	spdlog::info("Processor commit copy    : {:.6f} sec ({} existing files)", processorStats.commitCopySeconds, processorStats.copiedExistingFiles);
+	spdlog::info("Processor commit append  : {:.6f} sec", processorStats.commitAppendSeconds);
+	spdlog::info("Processor commit rename  : {:.6f} sec", processorStats.commitRenameSeconds);
+	spdlog::info("Processor committed files: {} created, {} total", processorStats.createdFiles, processorStats.committedFiles);
 }
 
 } // namespace
@@ -149,9 +216,10 @@ int main(int argc, char* argv[])
 
 	std::string inputPath;
 	std::string outputDir = "OutPutStore";
-	size_t minRamInt = 2;
 	bool showHelp = false;
 	bool sortAndDeduplicate = false;
+	bool benchmark = false;
+	size_t workers = 1;
 
 	for (int i = 1; i < argc; ++i)
 	{
@@ -160,9 +228,10 @@ int main(int argc, char* argv[])
 		{
 			outputDir = argv[++i];
 		}
-		else if (arg == "-R" && i + 1 < argc)
+		else if (arg == "-R")
 		{
-			minRamInt = static_cast<size_t>(std::stoull(argv[++i]));
+			spdlog::error("-R was removed from yfile2mseed_append; append batching is managed internally.");
+			return 2;
 		}
 		else if (arg == "-V2")
 		{
@@ -171,6 +240,19 @@ int main(int argc, char* argv[])
 		else if (arg == "--sort-dedup")
 		{
 			sortAndDeduplicate = true;
+		}
+		else if (arg == "--benchmark")
+		{
+			benchmark = true;
+		}
+		else if (arg == "--workers" && i + 1 < argc)
+		{
+			workers = std::max<size_t>(1, static_cast<size_t>(std::stoull(argv[++i])));
+		}
+		else if (arg == "--workers")
+		{
+			spdlog::error("--workers requires a positive integer value.");
+			return 2;
 		}
 		else if (arg == "-h" || arg == "--help")
 		{
@@ -209,9 +291,11 @@ int main(int argc, char* argv[])
 		return 2;
 	}
 
+	CliBenchmarkStats benchmarkStats;
+	const auto collectStarted = SteadyClock::now();
 	const std::vector<std::string> files = collect_files(inputPath);
+	benchmarkStats.collectFilesSeconds += elapsed_seconds(collectStarted);
 	std::vector<std::string> errorFiles;
-	size_t totalRamSampleNum = 0;
 	size_t processed = 0;
 	size_t successCount = 0;
 	size_t failedCount = 0;
@@ -233,28 +317,48 @@ int main(int argc, char* argv[])
 			const fs::path path(filePath);
 			if (lower_extension(path) == ".zip")
 			{
-				if (!yfile2miniseed::cli::ziputils::IsZipFile(filePath))
+				benchmarkStats.zipFiles++;
+				const auto zipValidateStarted = SteadyClock::now();
+				const bool isZipFile = yfile2miniseed::cli::ziputils::IsZipFile(filePath);
+				benchmarkStats.zipValidateSeconds += elapsed_seconds(zipValidateStarted);
+				if (!isZipFile)
 				{
 					++failedCount;
 					errorFiles.push_back(filePath);
 					continue;
 				}
 
+				const auto zipExtractStarted = SteadyClock::now();
 				const auto extractedFiles = yfile2miniseed::cli::ziputils::ExtractZipToMemory(filePath);
+				benchmarkStats.zipExtractSeconds += elapsed_seconds(zipExtractStarted);
+				benchmarkStats.zipItems += extractedFiles.size();
+				for (const auto& yFile : extractedFiles)
+					benchmarkStats.zipExtractedBytes += yFile.data.size();
+
 				size_t zipIndex = 0;
 				for (const auto& yFile : extractedFiles)
 				{
 					++zipIndex;
 					spdlog::info("[{}/{}] ZIP item: {}", zipIndex, extractedFiles.size(), yFile.name);
 
-					if (yFile.data.empty() || !reader.ReadFromRAM(yFile.data.data(), yFile.data.size()))
+					bool readOk = false;
+					if (!yFile.data.empty())
+					{
+						const auto yReadStarted = SteadyClock::now();
+						readOk = reader.ReadFromRAM(yFile.data.data(), yFile.data.size());
+						benchmarkStats.yReadRamSeconds += elapsed_seconds(yReadStarted);
+						if (readOk)
+							benchmarkStats.ramYFilesRead++;
+					}
+
+					if (yFile.data.empty() || !readOk)
 					{
 						++failedCount;
 						errorFiles.push_back(yFile.name);
 						continue;
 					}
 
-					if (append_current_yfile(reader, processor, sidCorrector, totalRamSampleNum, minRamInt))
+					if (append_current_yfile(reader, processor, sidCorrector, &benchmarkStats))
 						++successCount;
 					else
 					{
@@ -263,23 +367,29 @@ int main(int argc, char* argv[])
 					}
 				}
 
-				if (!flush_pending_writers(processor, totalRamSampleNum))
+				if (!flush_pending_writers(processor, &benchmarkStats))
 					return 1;
 			}
-			else if (reader.ReadFromFile(filePath))
+			else
 			{
-				if (append_current_yfile(reader, processor, sidCorrector, totalRamSampleNum, minRamInt))
+				const auto yReadStarted = SteadyClock::now();
+				const bool readOk = reader.ReadFromFile(filePath);
+				benchmarkStats.yReadFileSeconds += elapsed_seconds(yReadStarted);
+				if (readOk)
+					benchmarkStats.fileYFilesRead++;
+
+				if (readOk && append_current_yfile(reader, processor, sidCorrector, &benchmarkStats))
 					++successCount;
+				else if (readOk)
+				{
+					++failedCount;
+					errorFiles.push_back(filePath);
+				}
 				else
 				{
 					++failedCount;
 					errorFiles.push_back(filePath);
 				}
-			}
-			else
-			{
-				++failedCount;
-				errorFiles.push_back(filePath);
 			}
 		}
 		catch (const std::exception& ex)
@@ -290,19 +400,18 @@ int main(int argc, char* argv[])
 		}
 	}
 
-	if (totalRamSampleNum > 0)
-	{
-		if (!flush_pending_writers(processor, totalRamSampleNum))
-			return 1;
-	}
-
 	spdlog::info(
-		"Finalizing append-only SDS session{}...",
-		sortAndDeduplicate ? " with sort/dedup" : "");
-	if (!processor.FinalizePendingSessionAppendOnly(sortAndDeduplicate, miniSeedVersion3))
+		"Finalizing append-only SDS session{} with {} worker(s)...",
+		sortAndDeduplicate ? " with sort/dedup" : "",
+		workers);
+	const auto finalizeStarted = SteadyClock::now();
+	if (!processor.FinalizePendingSessionAppendOnly(sortAndDeduplicate, miniSeedVersion3, workers))
 		return 1;
+	benchmarkStats.finalizeSeconds += elapsed_seconds(finalizeStarted);
 
+	const auto writeStatsStarted = SteadyClock::now();
 	yfile2miniseed::cli::stats::WriteStats();
+	benchmarkStats.writeStatsSeconds += elapsed_seconds(writeStatsStarted);
 
 	const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
 		std::chrono::steady_clock::now() - startTime);
@@ -320,6 +429,9 @@ int main(int argc, char* argv[])
 	spdlog::info("Failed Items     : {}", failedCount);
 	spdlog::info("Elapsed Time     : {:.2f} sec", elapsedSeconds);
 	spdlog::info("Processing Speed : {:.2f} file/sec", filesPerSecond);
+
+	if (benchmark)
+		print_benchmark(benchmarkStats, processor.GetAppendSessionStats());
 
 	if (!errorFiles.empty())
 	{

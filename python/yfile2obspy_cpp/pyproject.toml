@@ -1,0 +1,11 @@
+[build-system]
+requires = ["setuptools>=68", "numpy"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "yfile2obspy-cpp"
+version = "0.1.0"
+description = "Fast Nanometrics Y-file reader bindings for ObsPy workflows"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+

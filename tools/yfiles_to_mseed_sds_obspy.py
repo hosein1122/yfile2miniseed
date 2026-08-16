@@ -192,15 +192,24 @@ def ensure_empty_output(path: Path) -> None:
 
 @dataclass(frozen=True)
 class InputSource:
-    """One plain Y-file or one Y-file member stored inside a ZIP archive."""
+    """One plain Y-file or one Y-file member stored inside an archive."""
 
     container: Path
     member: str | None = None
     uncompressed_size: int = 0
     compressed_size: int = 0
+    archive_format: str | None = None
 
     @property
     def is_zip_member(self) -> bool:
+        return self.member is not None and self.archive_format == "zip"
+
+    @property
+    def is_rar_member(self) -> bool:
+        return self.member is not None and self.archive_format == "rar"
+
+    @property
+    def is_archive_member(self) -> bool:
         return self.member is not None
 
     @property
@@ -248,7 +257,8 @@ def iter_input_sources(root: Path, pattern: str, recursive: bool) -> list[InputS
     sources: list[InputSource] = []
 
     for path in paths:
-        if path.suffix.lower() != ".zip":
+        suffix = path.suffix.lower()
+        if suffix not in {".zip", ".rar"}:
             relative_name = relative_names[path]
             if matches_pattern(relative_name, pattern):
                 size = path.stat().st_size
@@ -261,18 +271,63 @@ def iter_input_sources(root: Path, pattern: str, recursive: bool) -> list[InputS
                 )
             continue
 
+        if suffix == ".zip":
+            try:
+                with zipfile.ZipFile(path, mode="r") as archive:
+                    for info in archive.infolist():
+                        if info.is_dir():
+                            continue
+
+                        member = info.filename.replace("\\", "/").lstrip("/")
+                        if not member:
+                            continue
+
+                        # Nested archives are intentionally not expanded.
+                        if member.lower().endswith((".zip", ".rar")):
+                            continue
+
+                        if not recursive and "/" in member:
+                            continue
+
+                        if not matches_pattern(member, pattern):
+                            continue
+
+                        if info.flag_bits & 0x1:
+                            raise RuntimeError(
+                                f"encrypted ZIP member is not supported: {path}!/{member}"
+                            )
+
+                        sources.append(
+                            InputSource(
+                                container=path,
+                                member=info.filename,
+                                uncompressed_size=int(info.file_size),
+                                compressed_size=int(info.compress_size),
+                                archive_format="zip",
+                            )
+                        )
+            except zipfile.BadZipFile as exc:
+                raise RuntimeError(f"invalid ZIP archive: {path}: {exc}") from exc
+            continue
+
         try:
-            with zipfile.ZipFile(path, mode="r") as archive:
+            import rarfile
+        except ImportError as exc:
+            raise RuntimeError(
+                f"RAR archive found but Python package 'rarfile' is not installed: {path}"
+            ) from exc
+
+        try:
+            with rarfile.RarFile(path) as archive:
                 for info in archive.infolist():
-                    if info.is_dir():
+                    if info.isdir():
                         continue
 
                     member = info.filename.replace("\\", "/").lstrip("/")
                     if not member:
                         continue
 
-                    # Nested ZIP archives are intentionally not expanded.
-                    if member.lower().endswith(".zip"):
+                    if member.lower().endswith((".zip", ".rar")):
                         continue
 
                     if not recursive and "/" in member:
@@ -281,21 +336,17 @@ def iter_input_sources(root: Path, pattern: str, recursive: bool) -> list[InputS
                     if not matches_pattern(member, pattern):
                         continue
 
-                    if info.flag_bits & 0x1:
-                        raise RuntimeError(
-                            f"encrypted ZIP member is not supported: {path}!/{member}"
-                        )
-
                     sources.append(
                         InputSource(
                             container=path,
                             member=info.filename,
                             uncompressed_size=int(info.file_size),
-                            compressed_size=int(info.compress_size),
+                            compressed_size=int(getattr(info, "compress_size", 0)),
+                            archive_format="rar",
                         )
                     )
-        except zipfile.BadZipFile as exc:
-            raise RuntimeError(f"invalid ZIP archive: {path}: {exc}") from exc
+        except Exception as exc:
+            raise RuntimeError(f"invalid or unsupported RAR archive: {path}: {exc}") from exc
 
     return sorted(
         sources,
@@ -308,7 +359,7 @@ def iter_input_sources(root: Path, pattern: str, recursive: bool) -> list[InputS
 
 class InputSourceReader:
     """
-    Reuse one open ZIP handle and read members sequentially.
+    Reuse one open archive handle and read members sequentially.
 
     In prefetch mode this object is used only by the background worker thread.
     In non-prefetch mode it performs the same synchronous behavior as P3.
@@ -316,7 +367,8 @@ class InputSourceReader:
 
     def __init__(self) -> None:
         self._archive_path: Path | None = None
-        self._archive: zipfile.ZipFile | None = None
+        self._archive = None
+        self._archive_format: str | None = None
 
     def __enter__(self) -> "InputSourceReader":
         return self
@@ -329,48 +381,68 @@ class InputSourceReader:
             self._archive.close()
         self._archive = None
         self._archive_path = None
+        self._archive_format = None
 
-    def _get_archive(self, path: Path) -> zipfile.ZipFile:
+    def _get_archive(self, source: InputSource):
         # Sources are sorted by container. Keeping only the current archive
         # open avoids repeated central-directory parsing without accumulating
         # open handles when more than one ZIP exists.
-        if self._archive is None or self._archive_path != path:
+        if (
+            self._archive is None
+            or self._archive_path != source.container
+            or self._archive_format != source.archive_format
+        ):
             self.close()
-            self._archive = zipfile.ZipFile(path, mode="r")
-            self._archive_path = path
+            if source.is_zip_member:
+                self._archive = zipfile.ZipFile(source.container, mode="r")
+            elif source.is_rar_member:
+                try:
+                    import rarfile
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "RAR support requires Python package 'rarfile'"
+                    ) from exc
+                self._archive = rarfile.RarFile(source.container)
+            else:
+                raise RuntimeError(f"not an archive member: {source.display_name}")
+            self._archive_path = source.container
+            self._archive_format = source.archive_format
         return self._archive
 
-    def read_zip_payload(self, source: InputSource) -> tuple[bytes, float]:
+    def read_archive_payload(self, source: InputSource) -> tuple[bytes, float]:
         """
-        Decompress one ZIP member and return payload plus worker elapsed time.
+        Decompress one archive member and return payload plus worker elapsed time.
 
         This method does not call ObsPy and is safe to execute in the dedicated
         single background worker used by the prefetch pipeline.
         """
-        if not source.is_zip_member:
+        if not source.is_archive_member:
             raise RuntimeError(
-                f"read_zip_payload requires a ZIP member: {source.display_name}"
+                f"read_archive_payload requires an archive member: {source.display_name}"
             )
 
         started = time.perf_counter()
         try:
-            archive = self._get_archive(source.container)
+            archive = self._get_archive(source)
             with archive.open(source.member, mode="r") as member_handle:
                 payload = member_handle.read()
         except Exception as exc:
             raise RuntimeError(
-                f"cannot decompress ZIP member {source.display_name}: {exc}"
+                f"cannot decompress archive member {source.display_name}: {exc}"
             ) from exc
 
         return payload, time.perf_counter() - started
 
+    def read_zip_payload(self, source: InputSource) -> tuple[bytes, float]:
+        return self.read_archive_payload(source)
+
     def read_y_stream(self, source: InputSource) -> Stream:
         """Synchronous input reader retained for --zip-prefetch 0."""
         try:
-            if not source.is_zip_member:
+            if not source.is_archive_member:
                 return read(str(source.container), format="Y")
 
-            payload, _ = self.read_zip_payload(source)
+            payload, _ = self.read_archive_payload(source)
             return read(io.BytesIO(payload), format="Y")
         except Exception as exc:
             raise RuntimeError(
@@ -388,14 +460,14 @@ def decode_zip_payload(source: InputSource, payload: bytes) -> Stream:
         ) from exc
 
 
-def submit_zip_prefetch(
+def submit_archive_prefetch(
     executor: ThreadPoolExecutor,
     reader: InputSourceReader,
     source: InputSource | None,
 ) -> Future[tuple[bytes, float]] | None:
-    if source is None or not source.is_zip_member:
+    if source is None or not source.is_archive_member:
         return None
-    return executor.submit(reader.read_zip_payload, source)
+    return executor.submit(reader.read_archive_payload, source)
 
 
 def read_sources_with_zip_prefetch(
@@ -418,7 +490,7 @@ def read_sources_with_zip_prefetch(
             max_workers=1,
             thread_name_prefix="zip-prefetch",
         ) as executor:
-            current_future = submit_zip_prefetch(
+            current_future = submit_archive_prefetch(
                 executor,
                 zip_reader,
                 sources[0],
@@ -428,10 +500,10 @@ def read_sources_with_zip_prefetch(
                 source_started = time.perf_counter()
 
                 payload: bytes | None = None
-                if source.is_zip_member:
+                if source.is_archive_member:
                     if current_future is None:
                         raise RuntimeError(
-                            f"missing ZIP prefetch future for {source.display_name}"
+                            f"missing archive prefetch future for {source.display_name}"
                         )
 
                     wait_started = time.perf_counter()
@@ -445,14 +517,14 @@ def read_sources_with_zip_prefetch(
                     if index + 1 < len(sources)
                     else None
                 )
-                current_future = submit_zip_prefetch(
+                current_future = submit_archive_prefetch(
                     executor,
                     zip_reader,
                     next_source,
                 )
 
                 decode_started = time.perf_counter()
-                if source.is_zip_member:
+                if source.is_archive_member:
                     current = decode_zip_payload(source, payload)
                     add_timing(timings, "zip_y_decode", decode_started)
                 else:
@@ -517,9 +589,9 @@ def decode_source_chunk_worker(
 
     with InputSourceReader() as source_reader:
         for source in sources:
-            if source.is_zip_member:
+            if source.is_archive_member:
                 stage_started = time.perf_counter()
-                payload, decompress_elapsed = source_reader.read_zip_payload(source)
+                payload, decompress_elapsed = source_reader.read_archive_payload(source)
                 local_timings["worker_zip_decompress"] += decompress_elapsed
 
                 decode_started = time.perf_counter()
@@ -1120,23 +1192,28 @@ def main() -> int:
         raise RuntimeError(f"no input files matched {args.pattern!r} under {input_root}")
 
     stage_started = time.perf_counter()
-    plain_file_count = sum(not source.is_zip_member for source in sources)
+    plain_file_count = sum(not source.is_archive_member for source in sources)
     zip_member_count = sum(source.is_zip_member for source in sources)
+    rar_member_count = sum(source.is_rar_member for source in sources)
     zip_archives = sorted(
         {source.container for source in sources if source.is_zip_member},
         key=lambda path: str(path).lower(),
     )
+    rar_archives = sorted(
+        {source.container for source in sources if source.is_rar_member},
+        key=lambda path: str(path).lower(),
+    )
     zip_uncompressed_bytes = sum(
-        source.uncompressed_size for source in sources if source.is_zip_member
+        source.uncompressed_size for source in sources if source.is_archive_member
     )
     zip_compressed_bytes = sum(
-        source.compressed_size for source in sources if source.is_zip_member
+        source.compressed_size for source in sources if source.is_archive_member
     )
     largest_zip_member_bytes = max(
         (
             source.uncompressed_size
             for source in sources
-            if source.is_zip_member
+            if source.is_archive_member
         ),
         default=0,
     )
@@ -1153,7 +1230,8 @@ def main() -> int:
     print(
         f"Input sources: {len(sources)} "
         f"(plain={plain_file_count}, zip_members={zip_member_count}, "
-        f"zip_archives={len(zip_archives)})"
+        f"rar_members={rar_member_count}, "
+        f"zip_archives={len(zip_archives)}, rar_archives={len(rar_archives)})"
     )
     print(
         "Performance profile: "
@@ -1161,9 +1239,9 @@ def main() -> int:
         f"y-chunk-size={args.y_chunk_size}, "
         f"pack-workers={args.pack_workers}"
     )
-    if zip_member_count:
+    if zip_member_count or rar_member_count:
         print(
-            "ZIP mode: members are decompressed one at a time in RAM; "
+            "Archive mode: members are decompressed one at a time in RAM; "
             "nothing is extracted to disk."
         )
 

@@ -1,9 +1,11 @@
 #pragma once
 
 #include <libmseed.h>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <map>
 #include <vector>
@@ -123,8 +125,33 @@ namespace yfile2miniseed {
 		bool AppendMSeedFileToPendingSession(const std::string& inputFile);
 		bool ClosePendingWriters();
 		bool FinalizePendingSession(bool miniSeedVersion3 = true);
-		bool FinalizePendingSessionAppendOnly(bool sortAndDeduplicate, bool miniSeedVersion3 = true);
+		bool FinalizePendingSessionAppendOnly(
+			bool sortAndDeduplicate,
+			bool miniSeedVersion3 = true,
+			size_t workers = 1);
 		const std::filesystem::path& PendingSessionPath() const { return pendingSessionPath; }
+
+		struct AppendSessionStats {
+			double packSeconds = 0.0;
+			double recordRouteSeconds = 0.0;
+			double pendingOpenSeconds = 0.0;
+			double pendingWriteSeconds = 0.0;
+			double pendingCloseSeconds = 0.0;
+			double validateSeconds = 0.0;
+			double commitCopySeconds = 0.0;
+			double commitAppendSeconds = 0.0;
+			double commitRenameSeconds = 0.0;
+			uint64_t packedRecords = 0;
+			uint64_t pendingRecords = 0;
+			uint64_t pendingBytes = 0;
+			uint64_t pendingFiles = 0;
+			uint64_t committedFiles = 0;
+			uint64_t copiedExistingFiles = 0;
+			uint64_t createdFiles = 0;
+			uint64_t validations = 0;
+		};
+
+		const AppendSessionStats& GetAppendSessionStats() const { return appendStats; }
 
 		//test
 		bool PropertyTestComputeOkSeg();
@@ -155,6 +182,8 @@ namespace yfile2miniseed {
 		std::map<std::string, PendingWriter> pendingWriters;
 		uint64_t pendingWriterClock = 0;
 		size_t maxOpenPendingWriters = 64;
+		mutable AppendSessionStats appendStats;
+		mutable std::mutex appendStatsMutex;
 
 
 
@@ -221,7 +250,13 @@ namespace yfile2miniseed {
 			uint32_t readFlags,
 			const char* label,
 			bool miniSeedVersion3);
+		bool RewriteFinalFileFromRecords(
+			const std::filesystem::path& finalPath,
+			bool skipAdjacentDuplicates,
+			const char* label);
 		bool ValidateMSeedFile(const std::filesystem::path& path) const;
+		void AddAppendStat(double AppendSessionStats::* field, double value) const;
+		void AddAppendStat(uint64_t AppendSessionStats::* field, uint64_t value = 1) const;
 		bool WriteTraceListFile(
 			MS3TraceList* traceList,
 			const std::filesystem::path& path,

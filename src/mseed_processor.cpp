@@ -4,9 +4,11 @@
 #include <spdlog/spdlog.h>
 #include <libmseed.h>
 #include <chrono>
+#include <atomic>
 #include <iostream>
 #include <fstream>
 #include <filesystem>
+#include <future>
 #include <map>
 #include <vector>
 #include <cstring>
@@ -21,11 +23,38 @@
 namespace yfile2miniseed {
 
 	namespace {
+		using SteadyClock = std::chrono::steady_clock;
+
 		struct PendingPackContext
 		{
 			MSeedProcessor* self = nullptr;
 			bool ok = true;
 		};
+
+		double ElapsedSeconds(SteadyClock::time_point start)
+		{
+			return std::chrono::duration<double>(SteadyClock::now() - start).count();
+		}
+
+		bool AppendFileToStreamBuffered(const std::filesystem::path& source, std::ofstream& output)
+		{
+			std::ifstream input(source, std::ios::binary);
+			if (!input)
+				return false;
+
+			std::vector<char> buffer(4 * 1024 * 1024);
+			while (input)
+			{
+				input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+				const std::streamsize readBytes = input.gcount();
+				if (readBytes > 0)
+					output.write(buffer.data(), readBytes);
+				if (!output)
+					return false;
+			}
+
+			return input.eof();
+		}
 	}
 
 	// constructor
@@ -473,6 +502,7 @@ namespace yfile2miniseed {
 			flags |= MSF_PACKVER2;
 
 		int64_t packedSamples = 0;
+		const auto packStarted = SteadyClock::now();
 		const int64_t packedRecords = msr3_pack(
 			msr,
 			&MSeedProcessor::PendingRecordHandler,
@@ -480,6 +510,9 @@ namespace yfile2miniseed {
 			&packedSamples,
 			flags,
 			verbose);
+		appendStats.packSeconds += ElapsedSeconds(packStarted);
+		if (packedRecords > 0)
+			appendStats.packedRecords += static_cast<uint64_t>(packedRecords);
 
 		msr->datasamples = nullptr;
 		msr->numsamples = 0;
@@ -556,6 +589,7 @@ namespace yfile2miniseed {
 
 	bool MSeedProcessor::ClosePendingWriters()
 	{
+		const auto closeStarted = SteadyClock::now();
 		bool ok = true;
 		for (auto& item : pendingWriters)
 		{
@@ -573,6 +607,7 @@ namespace yfile2miniseed {
 			}
 		}
 		pendingWriters.clear();
+		appendStats.pendingCloseSeconds += ElapsedSeconds(closeStarted);
 		return ok;
 	}
 
@@ -603,7 +638,10 @@ namespace yfile2miniseed {
 		return true;
 	}
 
-	bool MSeedProcessor::FinalizePendingSessionAppendOnly(bool sortAndDeduplicate, bool miniSeedVersion3)
+	bool MSeedProcessor::FinalizePendingSessionAppendOnly(
+		bool sortAndDeduplicate,
+		bool miniSeedVersion3,
+		size_t workers)
 	{
 		if (pendingSessionPath.empty())
 			return true;
@@ -611,6 +649,14 @@ namespace yfile2miniseed {
 		if (!ClosePendingWriters())
 			return false;
 
+		struct PendingCommitWork
+		{
+			std::filesystem::path finalPath;
+			std::filesystem::path pendingPath;
+		};
+
+		std::vector<PendingCommitWork> pendingWork;
+		pendingWork.reserve(pendingFilesByFinal.size());
 		std::vector<std::filesystem::path> committedFiles;
 		for (const auto& item : pendingFilesByFinal)
 		{
@@ -623,22 +669,95 @@ namespace yfile2miniseed {
 				continue;
 			}
 
-			if (!CommitOnePendingFileAppendOnly(finalPath, pendingPath))
-				return false;
+			pendingWork.push_back({ finalPath, pendingPath });
+		}
 
-			committedFiles.push_back(finalPath);
+		size_t workerCount = workers < pendingWork.size() ? workers : pendingWork.size();
+		if (workerCount == 0)
+			workerCount = 1;
+		if (workerCount == 1)
+		{
+			for (const auto& item : pendingWork)
+			{
+				if (!CommitOnePendingFileAppendOnly(item.finalPath, item.pendingPath))
+					return false;
+				committedFiles.push_back(item.finalPath);
+			}
+		}
+		else
+		{
+			std::atomic<size_t> nextIndex{ 0 };
+			std::mutex committedFilesMutex;
+			std::vector<std::future<bool>> futures;
+			futures.reserve(workerCount);
+
+			for (size_t worker = 0; worker < workerCount; ++worker)
+			{
+				futures.emplace_back(std::async(std::launch::async, [this, &pendingWork, &nextIndex, &committedFiles, &committedFilesMutex]() {
+					while (true)
+					{
+						const size_t index = nextIndex.fetch_add(1);
+						if (index >= pendingWork.size())
+							return true;
+
+						const auto& item = pendingWork[index];
+						if (!CommitOnePendingFileAppendOnly(item.finalPath, item.pendingPath))
+							return false;
+
+						std::lock_guard<std::mutex> lock(committedFilesMutex);
+						committedFiles.push_back(item.finalPath);
+					}
+				}));
+			}
+
+			for (auto& future : futures)
+			{
+				if (!future.get())
+					return false;
+			}
 		}
 
 		if (sortAndDeduplicate)
 		{
-			constexpr uint32_t sortReadFlags = MSF_VALIDATECRC | MSF_UNPACKDATA;
-			constexpr uint32_t dedupReadFlags = MSF_VALIDATECRC | MSF_UNPACKDATA | MSF_SKIPADJACENTDUPLICATES;
-			for (const auto& finalPath : committedFiles)
+			if (workerCount == 1 || committedFiles.size() < 2)
 			{
-				if (!RewriteFinalFileFromTraceList(finalPath, sortReadFlags, "Sort appended SDS", miniSeedVersion3))
-					return false;
-				if (!RewriteFinalFileFromTraceList(finalPath, dedupReadFlags, "Deduplicate appended SDS", miniSeedVersion3))
-					return false;
+				for (const auto& finalPath : committedFiles)
+				{
+					if (!RewriteFinalFileFromRecords(finalPath, false, "Sort appended SDS"))
+						return false;
+					if (!RewriteFinalFileFromRecords(finalPath, true, "Deduplicate appended SDS"))
+						return false;
+				}
+			}
+			else
+			{
+				std::atomic<size_t> nextIndex{ 0 };
+				std::vector<std::future<bool>> futures;
+				futures.reserve(workerCount);
+
+				for (size_t worker = 0; worker < workerCount; ++worker)
+				{
+					futures.emplace_back(std::async(std::launch::async, [this, &committedFiles, &nextIndex]() {
+						while (true)
+						{
+							const size_t index = nextIndex.fetch_add(1);
+							if (index >= committedFiles.size())
+								return true;
+
+							const auto& finalPath = committedFiles[index];
+							if (!RewriteFinalFileFromRecords(finalPath, false, "Sort appended SDS"))
+								return false;
+							if (!RewriteFinalFileFromRecords(finalPath, true, "Deduplicate appended SDS"))
+								return false;
+						}
+					}));
+				}
+
+				for (auto& future : futures)
+				{
+					if (!future.get())
+						return false;
+				}
 			}
 		}
 
@@ -729,10 +848,12 @@ namespace yfile2miniseed {
 			return false;
 		}
 
+		const auto routeStarted = SteadyClock::now();
 		MS3Record* parsed = nullptr;
 		const int parseCode = msr3_parse(record, static_cast<uint64_t>(recordLength), &parsed, 0, verbose);
 		if (parseCode != MS_NOERROR || !parsed)
 		{
+			appendStats.recordRouteSeconds += ElapsedSeconds(routeStarted);
 			spdlog::error("msr3_parse() failed for generated record: {}", ms_errorstr(parseCode));
 			msr3_free(&parsed);
 			return false;
@@ -741,22 +862,34 @@ namespace yfile2miniseed {
 		std::filesystem::path finalPath;
 		if (!BuildStrictSDSPath(finalPath, parsed->starttime, parsed->sid, pendingSdsRoot))
 		{
+			appendStats.recordRouteSeconds += ElapsedSeconds(routeStarted);
 			spdlog::error("Cannot build SDS path for SID '{}'", parsed->sid);
 			msr3_free(&parsed);
 			return false;
 		}
 		msr3_free(&parsed);
+		appendStats.recordRouteSeconds += ElapsedSeconds(routeStarted);
 
 		PendingWriter* writer = nullptr;
+		const auto openStarted = SteadyClock::now();
 		if (!OpenPendingWriter(finalPath, writer))
+		{
+			appendStats.pendingOpenSeconds += ElapsedSeconds(openStarted);
 			return false;
+		}
+		appendStats.pendingOpenSeconds += ElapsedSeconds(openStarted);
 
+		const auto writeStarted = SteadyClock::now();
 		writer->stream.write(record, recordLength);
+		appendStats.pendingWriteSeconds += ElapsedSeconds(writeStarted);
 		if (!writer->stream)
 		{
 			spdlog::error("Failed to write pending record to '{}'", writer->path.string());
 			return false;
 		}
+
+		appendStats.pendingRecords++;
+		appendStats.pendingBytes += static_cast<uint64_t>(recordLength);
 
 		return true;
 	}
@@ -821,6 +954,7 @@ namespace yfile2miniseed {
 		}
 
 		pendingFilesByFinal[key] = pendingPath;
+		appendStats.pendingFiles++;
 		auto inserted = pendingWriters.emplace(key, std::move(newWriter));
 		writer = &inserted.first->second;
 		return true;
@@ -911,6 +1045,7 @@ namespace yfile2miniseed {
 	{
 		MS3TraceList* validateList = nullptr;
 		constexpr uint32_t flags = MSF_VALIDATECRC | MSF_UNPACKDATA;
+		const auto validateStarted = SteadyClock::now();
 		const int retcode = ms3_readtracelist(
 			&validateList,
 			path.string().c_str(),
@@ -918,6 +1053,8 @@ namespace yfile2miniseed {
 			0,
 			flags,
 			verbose);
+		AddAppendStat(&AppendSessionStats::validateSeconds, ElapsedSeconds(validateStarted));
+		AddAppendStat(&AppendSessionStats::validations);
 		mstl3_free(&validateList, 1);
 
 		if (retcode != MS_NOERROR)
@@ -927,6 +1064,18 @@ namespace yfile2miniseed {
 		}
 
 		return true;
+	}
+
+	void MSeedProcessor::AddAppendStat(double AppendSessionStats::* field, double value) const
+	{
+		std::lock_guard<std::mutex> lock(appendStatsMutex);
+		appendStats.*field += value;
+	}
+
+	void MSeedProcessor::AddAppendStat(uint64_t AppendSessionStats::* field, uint64_t value) const
+	{
+		std::lock_guard<std::mutex> lock(appendStatsMutex);
+		appendStats.*field += value;
 	}
 
 	bool MSeedProcessor::ResolveStaleCommitState(const std::filesystem::path& finalPath) const
@@ -1131,14 +1280,14 @@ namespace yfile2miniseed {
 			return false;
 		}
 
-		if (!ValidateMSeedFile(pendingPath))
-			return false;
-
 		if (fs::exists(finalPath))
 		{
 			try
 			{
+				const auto copyStarted = SteadyClock::now();
 				fs::copy_file(finalPath, buildingPath, fs::copy_options::none);
+				AddAppendStat(&AppendSessionStats::commitCopySeconds, ElapsedSeconds(copyStarted));
+				AddAppendStat(&AppendSessionStats::copiedExistingFiles);
 			}
 			catch (const std::exception& ex)
 			{
@@ -1146,10 +1295,11 @@ namespace yfile2miniseed {
 				return false;
 			}
 
-			std::ifstream in(pendingPath, std::ios::binary);
+			const auto appendStarted = SteadyClock::now();
 			std::ofstream out(buildingPath, std::ios::binary | std::ios::app);
-			out << in.rdbuf();
-			if (!in || !out)
+			const bool appended = AppendFileToStreamBuffered(pendingPath, out);
+			AddAppendStat(&AppendSessionStats::commitAppendSeconds, ElapsedSeconds(appendStarted));
+			if (!appended || !out)
 			{
 				spdlog::error("Cannot append pending '{}' to building '{}'", pendingPath.string(), buildingPath.string());
 				return false;
@@ -1158,12 +1308,16 @@ namespace yfile2miniseed {
 		else
 		{
 			std::error_code ec;
+			const auto moveStarted = SteadyClock::now();
 			fs::rename(pendingPath, buildingPath, ec);
+			AddAppendStat(&AppendSessionStats::commitRenameSeconds, ElapsedSeconds(moveStarted));
 			if (ec)
 			{
 				try
 				{
+					const auto copyStarted = SteadyClock::now();
 					fs::copy_file(pendingPath, buildingPath, fs::copy_options::none);
+					AddAppendStat(&AppendSessionStats::commitCopySeconds, ElapsedSeconds(copyStarted));
 				}
 				catch (const std::exception& ex)
 				{
@@ -1171,6 +1325,7 @@ namespace yfile2miniseed {
 					return false;
 				}
 			}
+			AddAppendStat(&AppendSessionStats::createdFiles);
 		}
 
 		if (!ValidateMSeedFile(buildingPath))
@@ -1180,7 +1335,9 @@ namespace yfile2miniseed {
 		const bool hadOriginal = fs::exists(finalPath);
 		if (hadOriginal)
 		{
+			const auto renameStarted = SteadyClock::now();
 			fs::rename(finalPath, backupPath, ec);
+			AddAppendStat(&AppendSessionStats::commitRenameSeconds, ElapsedSeconds(renameStarted));
 			if (ec)
 			{
 				spdlog::error("Cannot move original '{}' to backup '{}': {}", finalPath.string(), backupPath.string(), ec.message());
@@ -1188,7 +1345,9 @@ namespace yfile2miniseed {
 			}
 		}
 
+		const auto renameStarted = SteadyClock::now();
 		fs::rename(buildingPath, finalPath, ec);
+		AddAppendStat(&AppendSessionStats::commitRenameSeconds, ElapsedSeconds(renameStarted));
 		if (ec)
 		{
 			spdlog::error("Cannot move building '{}' to final '{}': {}", buildingPath.string(), finalPath.string(), ec.message());
@@ -1202,23 +1361,10 @@ namespace yfile2miniseed {
 			return false;
 		}
 
-		if (!ValidateMSeedFile(finalPath))
-		{
-			std::error_code removeEc;
-			fs::remove(finalPath, removeEc);
-			if (hadOriginal)
-			{
-				std::error_code restoreEc;
-				fs::rename(backupPath, finalPath, restoreEc);
-				if (restoreEc)
-					spdlog::error("Cannot restore backup '{}': {}", backupPath.string(), restoreEc.message());
-			}
-			return false;
-		}
-
 		if (hadOriginal)
 			fs::remove(backupPath, ec);
 		fs::remove(pendingPath, ec);
+		AddAppendStat(&AppendSessionStats::committedFiles);
 
 		return true;
 	}
@@ -1284,6 +1430,167 @@ namespace yfile2miniseed {
 		{
 			std::error_code removeEc;
 			fs::remove(finalPath, removeEc);
+			std::error_code restoreEc;
+			fs::rename(backupPath, finalPath, restoreEc);
+			if (restoreEc)
+				spdlog::error("Cannot restore backup '{}': {}", backupPath.string(), restoreEc.message());
+			return false;
+		}
+
+		fs::remove(backupPath, ec);
+		return true;
+	}
+
+	bool MSeedProcessor::RewriteFinalFileFromRecords(
+		const std::filesystem::path& finalPath,
+		bool skipAdjacentDuplicates,
+		const char* label)
+	{
+		namespace fs = std::filesystem;
+
+		struct RawRecord
+		{
+			std::string sid;
+			nstime_t starttime = 0;
+			nstime_t endtime = 0;
+			int8_t pubversion = 0;
+			uint32_t crc = 0;
+			uint64_t inputOrder = 0;
+			std::vector<char> bytes;
+		};
+
+		if (!ResolveStaleCommitState(finalPath))
+			return false;
+
+		const std::string workBase = finalPath.filename().string() + "." + pendingSessionName;
+		const fs::path buildingPath = finalPath.parent_path() / (workBase + ".building");
+		const fs::path backupPath = finalPath.parent_path() / (workBase + ".backup");
+
+		if (fs::exists(buildingPath) || fs::exists(backupPath))
+		{
+			spdlog::error("Session work file already exists for '{}'", finalPath.string());
+			return false;
+		}
+
+		MS3FileParam* msfp = nullptr;
+		MS3Record* record = nullptr;
+		constexpr uint32_t flags = MSF_VALIDATECRC;
+		std::vector<RawRecord> records;
+		uint64_t inputOrder = 0;
+		int retcode = MS_NOERROR;
+
+		while ((retcode = ms3_readmsr_r(&msfp, &record, finalPath.string().c_str(), flags, verbose)) == MS_NOERROR)
+		{
+			if (!record || !record->record || record->reclen <= 0)
+			{
+				spdlog::error("{}: invalid MiniSEED record in '{}'", label ? label : "Rewrite records", finalPath.string());
+				ms3_readmsr_r(&msfp, &record, nullptr, 0, 0);
+				return false;
+			}
+
+			const nstime_t endtime = msr3_endtime(record);
+			if (endtime == NSTERROR)
+			{
+				spdlog::error("{}: cannot calculate record end time in '{}'", label ? label : "Rewrite records", finalPath.string());
+				ms3_readmsr_r(&msfp, &record, nullptr, 0, 0);
+				return false;
+			}
+
+			RawRecord item;
+			item.sid = record->sid;
+			item.starttime = record->starttime;
+			item.endtime = endtime;
+			item.pubversion = record->pubversion;
+			item.crc = ms_crc32c(reinterpret_cast<const uint8_t*>(record->record), record->reclen, 0);
+			item.inputOrder = inputOrder++;
+			item.bytes.assign(record->record, record->record + record->reclen);
+			records.emplace_back(std::move(item));
+		}
+
+		ms3_readmsr_r(&msfp, &record, nullptr, 0, 0);
+
+		if (retcode != MS_ENDOFFILE && retcode != MS_NOERROR)
+		{
+			spdlog::error("{}: cannot read '{}': {}", label ? label : "Rewrite records", finalPath.string(), ms_errorstr(retcode));
+			return false;
+		}
+
+		std::stable_sort(
+			records.begin(),
+			records.end(),
+			[](const RawRecord& lhs, const RawRecord& rhs)
+			{
+				if (lhs.sid != rhs.sid)
+					return lhs.sid < rhs.sid;
+				if (lhs.pubversion != rhs.pubversion)
+					return lhs.pubversion < rhs.pubversion;
+				if (lhs.starttime != rhs.starttime)
+					return lhs.starttime < rhs.starttime;
+				if (lhs.endtime != rhs.endtime)
+					return lhs.endtime < rhs.endtime;
+				if (lhs.crc != rhs.crc)
+					return lhs.crc < rhs.crc;
+				return lhs.inputOrder < rhs.inputOrder;
+			});
+
+		try
+		{
+			fs::create_directories(finalPath.parent_path());
+		}
+		catch (const std::exception& ex)
+		{
+			spdlog::error("Cannot create final SDS directory '{}': {}", finalPath.parent_path().string(), ex.what());
+			return false;
+		}
+
+		std::ofstream out(buildingPath, std::ios::binary | std::ios::trunc);
+		if (!out)
+		{
+			spdlog::error("Cannot open building file '{}'", buildingPath.string());
+			return false;
+		}
+
+		const RawRecord* previousWritten = nullptr;
+		for (const RawRecord& item : records)
+		{
+			if (skipAdjacentDuplicates &&
+				previousWritten &&
+				item.crc == previousWritten->crc &&
+				item.bytes == previousWritten->bytes)
+			{
+				continue;
+			}
+
+			out.write(item.bytes.data(), static_cast<std::streamsize>(item.bytes.size()));
+			if (!out)
+			{
+				spdlog::error("Cannot write building file '{}'", buildingPath.string());
+				return false;
+			}
+			previousWritten = &item;
+		}
+		out.close();
+		if (!out)
+		{
+			spdlog::error("Cannot close building file '{}'", buildingPath.string());
+			return false;
+		}
+
+		if (!ValidateMSeedFile(buildingPath))
+			return false;
+
+		std::error_code ec;
+		fs::rename(finalPath, backupPath, ec);
+		if (ec)
+		{
+			spdlog::error("Cannot move original '{}' to backup '{}': {}", finalPath.string(), backupPath.string(), ec.message());
+			return false;
+		}
+
+		fs::rename(buildingPath, finalPath, ec);
+		if (ec)
+		{
+			spdlog::error("Cannot move building '{}' to final '{}': {}", buildingPath.string(), finalPath.string(), ec.message());
 			std::error_code restoreEc;
 			fs::rename(backupPath, finalPath, restoreEc);
 			if (restoreEc)
