@@ -18,6 +18,136 @@ overlapping Y-file segments may be present.
 
 The main target platform is Windows with Visual Studio/MSVC.
 
+## Windows Setup From Zero
+
+Use these steps on a clean Windows machine when you want to run the hybrid SDS
+converter from source.
+
+1. Install the required tools:
+
+```bat
+winget install Git.Git
+winget install Python.Python.3.14
+winget install Kitware.CMake
+winget install Ninja-build.Ninja
+winget install Microsoft.VisualStudio.2022.BuildTools --override "--wait --passive --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended"
+```
+
+If you already have Visual Studio Community/Professional with the C++ workload,
+you can skip the Build Tools install.
+
+2. Optional, install RAR support:
+
+```bat
+python -m pip install rarfile
+winget install 7zip.7zip
+setx PATH "%PATH%;C:\Program Files\7-Zip"
+```
+
+Open a new terminal after installing Python, Visual Studio tools, or changing
+`PATH`.
+
+3. Clone the repository:
+
+```bat
+cd /d D:\
+git clone https://github.com/hosein1122/yfile2miniseed.git
+cd /d D:\yfile2miniseed
+```
+
+4. Open an x64 Visual Studio Developer Command Prompt.
+
+You can open it from the Start menu as:
+
+```text
+x64 Native Tools Command Prompt for VS
+```
+
+Or start it from an existing `cmd.exe`:
+
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\BuildTools\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+```
+
+If you installed Visual Studio Community instead of Build Tools, the path is
+usually:
+
+```bat
+call "C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\Tools\VsDevCmd.bat" -arch=x64 -host_arch=x64
+```
+
+5. Build the C++ reader/tools:
+
+```bat
+cd /d D:\yfile2miniseed
+cmake -S . -B out\build\x64-Release -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF
+cmake --build out\build\x64-Release --config Release
+```
+
+6. Install the Python dependencies and native Y-file reader:
+
+```bat
+python -m pip install --upgrade pip setuptools wheel build numpy obspy
+python -m pip install --force-reinstall .\python\yfile2obspy_cpp
+```
+
+Check that the native reader is available:
+
+```bat
+python -c "import yfile2obspy_cpp; print(yfile2obspy_cpp.__all__)"
+```
+
+Expected output includes:
+
+```text
+read_yfile_path
+read_yfile_bytes
+```
+
+7. Build the local SID correction file:
+
+```bat
+out\build\x64-Release\apps\yfile2mseed_cli\yfile2mseed_sid_scan.exe ^
+  D:\YFiles ^
+  -o CorrectSID.txt
+```
+
+Review `CorrectSID.txt` before a production run. It is local/operator-specific
+and is intentionally ignored by git.
+
+8. Run the hybrid converter:
+
+```bat
+python tools\yfiles_to_mseed_sds_hybrid_cppread.py ^
+  --input-root D:\YFiles ^
+  --output-root D:\MainSDS ^
+  --correct-sid CorrectSID.txt ^
+  --encoding STEIM2 ^
+  --record-length 4096 ^
+  --pack-workers 4 ^
+  --quiet ^
+  --report D:\MainSDS_hybrid_report.json
+```
+
+The input folder can contain plain Y-files, ZIP files, and, when the optional
+RAR setup is installed, RAR files. The converter scans recursively by default.
+
+9. Verify the SDS output:
+
+```bat
+python tools\sds_availability_report.py ^
+  --input D:\MainSDS ^
+  --output D:\MainSDS_reports\availability
+
+python tools\sds_raw_segment_report.py ^
+  --input D:\MainSDS ^
+  --output D:\MainSDS_reports\raw_segments.txt ^
+  --no-split-on-sequence-reset
+```
+
+For repeatable ingestion into a main SDS archive, keep an external manifest of
+already-ingested source files and skip files that were processed before.
+
 ## Recommended Quick Start
 
 Build the C++ tools:
