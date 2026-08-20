@@ -71,6 +71,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--correct-sid", type=Path, default=DEFAULT_CORRECT_SID)
     parser.add_argument("--no-correct-sid", action="store_true")
     parser.add_argument("--report", type=Path, help="Optional JSON report path outside output-root.")
+    parser.add_argument(
+        "--error-log",
+        type=Path,
+        help=(
+            "Path for skipped Y-file read errors. Default: "
+            "<output-root>/_yfile_read_errors.log"
+        ),
+    )
     parser.add_argument("--progress-every", type=int, default=100)
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument(
@@ -316,7 +324,7 @@ def read_stream_from_extension(
     input_root: Path,
     corrections: dict[str, tuple[str, str, str, str]] | None,
     timings: dict[str, float],
-) -> tuple[Stream, dict[str, int]]:
+) -> tuple[Stream, dict]:
     if yfile2obspy_cpp is None:
         raise RuntimeError("yfile2obspy_cpp is not importable")
 
@@ -327,28 +335,65 @@ def read_stream_from_extension(
     stream = Stream()
     sample_count = 0
     source_bytes_done = 0
+    successful_source_bytes = 0
     plain_count = 0
     zip_member_count = 0
     rar_member_count = 0
+    read_errors: list[dict] = []
     total_source_bytes = sum(source.uncompressed_size for source in sources)
 
     started = time.perf_counter()
     with base.InputSourceReader() as source_reader:
         for index, source in enumerate(sources, start=1):
             stage_started = time.perf_counter()
+            try:
+                if source.is_archive_member:
+                    payload, decompress_elapsed = source_reader.read_archive_payload(source)
+                    timings["archive_decompress"] += decompress_elapsed
+                    record = yfile2obspy_cpp.read_yfile_bytes(payload)
+                else:
+                    record = yfile2obspy_cpp.read_yfile_path(str(source.container))
+            except Exception as exc:
+                base.add_timing(timings, "cpp_extension_read", stage_started)
+                source_bytes_done += source.uncompressed_size
+                read_errors.append(
+                    {
+                        "index": index,
+                        "total": len(sources),
+                        "source": source.display_name,
+                        "source_bytes": int(source.uncompressed_size),
+                        "error_type": type(exc).__name__,
+                        "error": str(exc),
+                    }
+                )
+                print(
+                    f"WARNING: skipped unreadable Y source [{index}/{len(sources)}] "
+                    f"{source.display_name}: {type(exc).__name__}: {exc}",
+                    file=sys.stderr,
+                )
+                print_bridge_progress(
+                    args,
+                    timings,
+                    index,
+                    len(sources),
+                    source_bytes_done,
+                    total_source_bytes,
+                    f"skipped unreadable source {source.display_name}",
+                )
+                continue
+
+            base.add_timing(timings, "cpp_extension_read", stage_started)
+
             if source.is_archive_member:
-                payload, decompress_elapsed = source_reader.read_archive_payload(source)
-                timings["archive_decompress"] += decompress_elapsed
-                record = yfile2obspy_cpp.read_yfile_bytes(payload)
                 if source.is_zip_member:
                     zip_member_count += 1
                 elif source.is_rar_member:
                     rar_member_count += 1
             else:
-                record = yfile2obspy_cpp.read_yfile_path(str(source.container))
                 plain_count += 1
-            base.add_timing(timings, "cpp_extension_read", stage_started)
 
+            # Metadata/configuration errors are intentionally NOT skipped.
+            # A missing CorrectSID entry is a configuration problem, not a bad Y-file.
             stage_started = time.perf_counter()
             current = Stream([trace_from_cpp_record(record)])
             base.add_timing(timings, "cpp_extension_trace_build", stage_started)
@@ -364,6 +409,7 @@ def read_stream_from_extension(
             npts = int(record["npts"])
             sample_count += npts
             source_bytes_done += source.uncompressed_size
+            successful_source_bytes += source.uncompressed_size
             print_bridge_progress(
                 args,
                 timings,
@@ -376,13 +422,49 @@ def read_stream_from_extension(
 
     timings["cpp_extension_read_wall"] = time.perf_counter() - started
     return stream, {
-        "files_read": len(sources),
+        "sources_found": len(sources),
+        "files_read": len(sources) - len(read_errors),
+        "files_skipped": len(read_errors),
         "plain_files_read": plain_count,
         "zip_members_read": zip_member_count,
         "rar_members_read": rar_member_count,
         "samples_read": sample_count,
         "total_source_bytes": total_source_bytes,
+        "successful_source_bytes": successful_source_bytes,
+        "read_errors": read_errors,
     }
+
+
+def write_read_error_log(
+    path: Path,
+    input_root: Path,
+    errors: list[dict],
+) -> None:
+    """Write a human-readable list of skipped unreadable Y sources."""
+    if not errors:
+        # Do not leave a stale error log from an older run.
+        if path.exists():
+            path.unlink()
+        return
+
+    lines = [
+        "Nanometrics Y-file read errors",
+        f"Input root: {input_root}",
+        f"Skipped sources: {len(errors)}",
+        "",
+    ]
+    for item in errors:
+        lines.extend(
+            [
+                f"[{item['index']}/{item['total']}] {item['source']}",
+                f"Size: {item['source_bytes']} bytes",
+                f"Error: {item['error_type']}: {item['error']}",
+                "",
+            ]
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines), encoding="utf-8")
 
 
 def iter_trace_days(trace: Trace):
@@ -730,8 +812,19 @@ def main() -> int:
     else:
         input_decode_mode = "cpp_bridge"
         stream, read_stats = read_stream_from_bridge(args, input_root, corrections, timings)
+    read_errors = read_stats.get("read_errors", [])
+    error_log = (
+        args.error_log.resolve()
+        if args.error_log is not None
+        else output_root / "_yfile_read_errors.log"
+    )
+    write_read_error_log(error_log, input_root, read_errors)
+
     if not stream:
-        raise RuntimeError("C++ reader returned no traces")
+        raise RuntimeError(
+            "C++ reader returned no usable traces"
+            + (f"; skipped={len(read_errors)}; see {error_log}" if read_errors else "")
+        )
 
     new_trace_count = len(stream)
     existing_stream, touched_paths, existing_files_read, existing_traces_read = (
@@ -779,7 +872,11 @@ def main() -> int:
         "bridge_exe": str(args.bridge_exe) if input_decode_mode == "cpp_bridge" else None,
         "obspy": obspy.__version__,
         "numpy": np.__version__,
+        "sources_found": read_stats.get("sources_found", read_stats["files_read"]),
         "files_read": read_stats["files_read"],
+        "files_skipped": read_stats.get("files_skipped", 0),
+        "read_error_log": str(error_log) if read_errors else None,
+        "read_errors": read_errors,
         "plain_files_read": read_stats["plain_files_read"],
         "zip_members_read": read_stats["zip_members_read"],
         "rar_members_read": read_stats.get("rar_members_read", 0),
@@ -838,15 +935,19 @@ def main() -> int:
                 continue
             print(f"  {name:30s} {seconds:12.6f} s")
 
-    print("Completed successfully")
+    print("Completed with warnings" if read_errors else "Completed successfully")
     print(
         "Summary: "
         f"elapsed={report['elapsed_seconds']:.6f}s, "
-        f"files={report['files_read']}, "
+        f"files={report['files_read']}/{report['sources_found']}, "
+        f"skipped={report['files_skipped']}, "
         f"samples={report['samples_written']}, "
         f"records={report['records_written']}, "
         f"sds_files={report['sds_files_replaced']}"
     )
+    if read_errors:
+        print(f"WARNING: skipped {len(read_errors)} unreadable source(s)", file=sys.stderr)
+        print(f"Read error log: {error_log}", file=sys.stderr)
     if args.report:
         print(f"Report: {args.report}")
     return 0
