@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import shutil
 import subprocess
@@ -11,6 +12,7 @@ import sys
 import tempfile
 import time
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -440,14 +442,13 @@ def write_read_error_log(
     input_root: Path,
     errors: list[dict],
 ) -> None:
-    """Write a human-readable list of skipped unreadable Y sources."""
+    """Append a human-readable list of skipped unreadable Y sources."""
     if not errors:
-        # Do not leave a stale error log from an older run.
-        if path.exists():
-            path.unlink()
         return
 
     lines = [
+        "=" * 80,
+        f"Run: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         "Nanometrics Y-file read errors",
         f"Input root: {input_root}",
         f"Skipped sources: {len(errors)}",
@@ -464,7 +465,11 @@ def write_read_error_log(
         )
 
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines), encoding="utf-8")
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        if path.stat().st_size > 0:
+            handle.write("\n")
+        handle.write("\n".join(lines))
+        handle.write("\n")
 
 
 def iter_trace_days(trace: Trace):
@@ -531,6 +536,444 @@ def replace_staged_sds_files(
     return replaced
 
 
+def remove_temp_file_with_retry(
+    path: Path,
+    timings: dict[str, float],
+    attempts: int = 20,
+) -> bool:
+    """
+    Best-effort removal of a temporary MiniSEED file on Windows.
+
+    Antivirus/indexing software can briefly hold a file after it has been closed,
+    producing WinError 32. Retry with a short bounded backoff. A cleanup failure
+    must not abort an otherwise valid SDS conversion.
+    """
+    stage_started = time.perf_counter()
+    last_error: OSError | None = None
+
+    for attempt in range(attempts):
+        try:
+            path.unlink(missing_ok=True)
+            base.add_timing(timings, "pack_disk_file_delete", stage_started)
+            return True
+        except OSError as exc:
+            is_sharing_violation = (
+                isinstance(exc, PermissionError)
+                or getattr(exc, "winerror", None) in (5, 32)
+            )
+            if not is_sharing_violation:
+                base.add_timing(timings, "pack_disk_file_delete", stage_started)
+                raise
+
+            last_error = exc
+            if attempt + 1 < attempts:
+                time.sleep(min(0.50, 0.02 * (attempt + 1)))
+
+    base.add_timing(timings, "pack_disk_file_delete", stage_started)
+    print(
+        "WARNING: could not delete temporary MiniSEED file after retries; "
+        f"continuing and leaving it for OS cleanup: {path}: {last_error}",
+        file=sys.stderr,
+    )
+    return False
+
+
+def pack_trace_records_disk_robust(
+    trace: Trace,
+    args: argparse.Namespace,
+    temp_dir: Path,
+    trace_index: int,
+    timings: dict[str, float],
+):
+    """Disk packing fallback with Windows-safe temporary-file cleanup."""
+    temp_path = temp_dir / f"trace_{trace_index:08d}.mseed"
+
+    try:
+        stage_started = time.perf_counter()
+        Stream([trace]).write(
+            str(temp_path),
+            format="MSEED",
+            encoding=args.encoding,
+            reclen=args.record_length,
+            flush=True,
+        )
+        base.add_timing(timings, "pack_disk_mseed_write", stage_started)
+
+        stage_started = time.perf_counter()
+        file_size = temp_path.stat().st_size
+        base.add_timing(timings, "pack_disk_file_stat", stage_started)
+        base.validate_packed_size(file_size, trace, args.record_length)
+
+        stage_started = time.perf_counter()
+        handle = temp_path.open("rb")
+        base.add_timing(timings, "pack_disk_file_open", stage_started)
+
+        try:
+            record_index = 0
+            while True:
+                stage_started = time.perf_counter()
+                record = handle.read(args.record_length)
+                base.add_timing(timings, "pack_disk_record_read", stage_started)
+
+                if not record:
+                    break
+
+                record_index += 1
+                if len(record) != args.record_length:
+                    raise RuntimeError(
+                        f"short MiniSEED record for {trace.id}: "
+                        f"record={record_index}, bytes={len(record)}"
+                    )
+
+                stage_started = time.perf_counter()
+                info = base.get_record_information(io.BytesIO(record))
+                base.add_timing(timings, "pack_record_header_parse", stage_started)
+
+                actual_length = int(info.get("record_length", args.record_length))
+                if actual_length != args.record_length:
+                    raise RuntimeError(
+                        f"unexpected MiniSEED record length for {trace.id}: "
+                        f"record={record_index}, expected={args.record_length}, "
+                        f"actual={actual_length}"
+                    )
+
+                record_start = info.get("starttime")
+                if record_start is None:
+                    raise RuntimeError(
+                        f"MiniSEED record start time is missing for {trace.id}: "
+                        f"record={record_index}"
+                    )
+
+                yield record_start, record
+        finally:
+            stage_started = time.perf_counter()
+            handle.close()
+            base.add_timing(timings, "pack_disk_file_close", stage_started)
+    finally:
+        remove_temp_file_with_retry(temp_path, timings)
+
+
+
+def steim2_jump_diagnostics(trace: Trace) -> dict:
+    """
+    Find the largest consecutive int32 sample jump.
+
+    STEIM2's largest single difference is a signed 30-bit value:
+    -2^29 .. 2^29-1.  Use int64 arithmetic so np.diff cannot overflow.
+    """
+    data = np.asarray(trace.data, dtype=np.int64)
+    info = {
+        "npts": int(trace.stats.npts),
+        "starttime": str(trace.stats.starttime),
+        "endtime": str(trace.stats.endtime),
+        "sampling_rate": float(trace.stats.sampling_rate),
+        "min_sample": int(data.min()) if data.size else None,
+        "max_sample": int(data.max()) if data.size else None,
+        "largest_jump": None,
+        "largest_jump_abs": None,
+        "sample_index_before": None,
+        "sample_index_after": None,
+        "sample_before": None,
+        "sample_after": None,
+        "jump_time": None,
+        "exceeds_steim2_30bit": False,
+    }
+
+    if data.size < 2:
+        return info
+
+    diffs = np.diff(data)
+    abs_diffs = np.abs(diffs)
+    pos = int(np.argmax(abs_diffs))
+    jump = int(diffs[pos])
+
+    info["largest_jump"] = jump
+    info["largest_jump_abs"] = int(abs_diffs[pos])
+    info["sample_index_before"] = pos
+    info["sample_index_after"] = pos + 1
+    info["sample_before"] = int(data[pos])
+    info["sample_after"] = int(data[pos + 1])
+    info["jump_time"] = str(
+        trace.stats.starttime + (pos + 1) / float(trace.stats.sampling_rate)
+    )
+    info["exceeds_steim2_30bit"] = (
+        jump < -(1 << 29) or jump > ((1 << 29) - 1)
+    )
+    return info
+
+
+def pack_trace_to_memory_with_encoding(
+    trace: Trace,
+    args: argparse.Namespace,
+    encoding: str,
+    timings: dict[str, float],
+) -> bytes:
+    """Pack one Trace to a MiniSEED bytes buffer with an explicit encoding."""
+    buffer = io.BytesIO()
+
+    stage_started = time.perf_counter()
+    Stream([trace]).write(
+        buffer,
+        format="MSEED",
+        encoding=encoding,
+        reclen=args.record_length,
+        flush=True,
+    )
+    base.add_timing(timings, "pack_memory_mseed_write", stage_started)
+
+    stage_started = time.perf_counter()
+    payload = buffer.getvalue()
+    base.add_timing(timings, "pack_memory_buffer_copy", stage_started)
+
+    base.validate_packed_size(len(payload), trace, args.record_length)
+    return payload
+
+
+def is_steim_pack_error(exc: Exception) -> bool:
+    message = str(exc)
+    return (
+        "Unable to represent difference" in message
+        or "msr_encode_steim" in message
+        or "Error packing data samples" in message
+    )
+
+
+def write_encoding_fallback_log(
+    path: Path,
+    input_root: Path,
+    fallbacks: list[dict],
+) -> None:
+    """Append Trace-level STEIM -> INT32 fallbacks to a diagnostic log."""
+    if not fallbacks:
+        return
+
+    lines = [
+        "=" * 80,
+        f"Run: {time.strftime('%Y-%m-%d %H:%M:%S')}",
+        "MiniSEED encoding fallbacks",
+        f"Input root: {input_root}",
+        f"Fallback traces: {len(fallbacks)}",
+        "",
+    ]
+
+    for item in fallbacks:
+        lines.extend(
+            [
+                f"Trace [{item['trace_index']}] {item['trace_id']}",
+                f"Time: {item['starttime']} -> {item['endtime']}",
+                f"Requested encoding: {item['requested_encoding']}",
+                f"Actual encoding: {item['actual_encoding']}",
+                f"Samples: npts={item['npts']}, min={item['min_sample']}, max={item['max_sample']}",
+                (
+                    "Largest jump: "
+                    f"{item['sample_before']} -> {item['sample_after']} "
+                    f"(diff={item['largest_jump']}, abs={item['largest_jump_abs']})"
+                ),
+                (
+                    "Jump location: "
+                    f"index {item['sample_index_before']} -> {item['sample_index_after']}, "
+                    f"time={item['jump_time']}"
+                ),
+                f"Exceeds STEIM2 signed-30-bit range: {item['exceeds_steim2_30bit']}",
+                f"Original packing error: {item['packing_error']}",
+                "",
+            ]
+        )
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        if path.stat().st_size > 0:
+            handle.write("\n")
+        handle.write("\n".join(lines))
+        handle.write("\n")
+
+
+
+def pack_trace_memory_worker_robust(task):
+    """
+    Thread worker: pack with requested encoding, but retry a STEIM range failure
+    as INT32 for this Trace only.
+    """
+    trace_index, trace, encoding, record_length = task
+
+    try:
+        result = base.pack_trace_memory_worker(task)
+        return result, None
+    except Exception as exc:
+        if (
+            encoding not in ("STEIM1", "STEIM2")
+            or not is_steim_pack_error(exc)
+        ):
+            raise
+
+        diagnostics = steim2_jump_diagnostics(trace)
+        int32_task = (trace_index, trace, "INT32", record_length)
+
+        try:
+            result = base.pack_trace_memory_worker(int32_task)
+        except Exception as int32_exc:
+            raise RuntimeError(
+                f"{trace.id}: {encoding} packing failed and INT32 fallback "
+                f"also failed. Original={type(exc).__name__}: {exc}; "
+                f"INT32={type(int32_exc).__name__}: {int32_exc}"
+            ) from int32_exc
+
+        fallback = {
+            "trace_index": trace_index,
+            "trace_id": trace.id,
+            "requested_encoding": encoding,
+            "actual_encoding": "INT32",
+            "packing_error": f"{type(exc).__name__}: {exc}",
+            **diagnostics,
+        }
+        return result, fallback
+
+
+def pack_stream_in_parallel_robust(
+    stream: Stream,
+    args: argparse.Namespace,
+    timings: dict[str, float],
+) -> tuple[list[base.PackedTraceResult], list[dict]]:
+    """
+    Parallel RAM packing that keeps STEIM compression failures local to a Trace.
+    """
+    tasks = [
+        (
+            trace_index,
+            trace,
+            args.encoding,
+            args.record_length,
+        )
+        for trace_index, trace in enumerate(stream, start=1)
+    ]
+
+    started = time.perf_counter()
+    with ThreadPoolExecutor(
+        max_workers=min(args.pack_workers, max(1, len(tasks))),
+        thread_name_prefix="mseed-pack",
+    ) as executor:
+        pairs = list(executor.map(pack_trace_memory_worker_robust, tasks))
+    timings["parallel_pack_wall"] += time.perf_counter() - started
+
+    results: list[base.PackedTraceResult] = []
+    fallbacks: list[dict] = []
+
+    for result, fallback in pairs:
+        results.append(result)
+        timings["pack_thread_mseed_write_sum"] += result.mseed_write_seconds
+        timings["pack_thread_buffer_copy_sum"] += result.buffer_copy_seconds
+        timings["pack_thread_record_slice_sum"] += result.record_slice_seconds
+        timings["pack_thread_header_parse_sum"] += result.header_parse_seconds
+
+        if fallback is not None:
+            fallbacks.append(fallback)
+            print(
+                "WARNING: "
+                f"{fallback['requested_encoding']} cannot encode Trace "
+                f"[{fallback['trace_index']}] {fallback['trace_id']}; "
+                "packed this Trace as INT32 instead. "
+                f"largest_jump={fallback['largest_jump']} "
+                f"({fallback['sample_before']} -> {fallback['sample_after']}) "
+                f"at {fallback['jump_time']}",
+                file=sys.stderr,
+            )
+
+    return results, fallbacks
+
+
+def pack_trace_records_robust(
+    trace: Trace,
+    args: argparse.Namespace,
+    temp_dir: Path,
+    trace_index: int,
+    timings: dict[str, float],
+    backend_state: base.PackBackendState,
+    encoding_fallbacks: list[dict],
+):
+    """
+    Prefer per-trace RAM packing.
+
+    If STEIM compression cannot represent a sample difference, retry ONLY this
+    Trace as INT32. Disk fallback is reserved for non-encoding RAM failures.
+    """
+    if backend_state.active == "memory":
+        try:
+            payload = base.pack_trace_to_memory(trace, args, timings)
+        except Exception as exc:
+            # A disk retry with the same STEIM encoding cannot fix an encoding
+            # range error. Preserve every sample by writing this Trace as INT32.
+            if (
+                args.encoding in ("STEIM1", "STEIM2")
+                and is_steim_pack_error(exc)
+            ):
+                diagnostics = steim2_jump_diagnostics(trace)
+
+                try:
+                    payload = pack_trace_to_memory_with_encoding(
+                        trace,
+                        args,
+                        "INT32",
+                        timings,
+                    )
+                except Exception as int32_exc:
+                    raise RuntimeError(
+                        f"{trace.id}: {args.encoding} packing failed and INT32 "
+                        f"fallback also failed. Original={type(exc).__name__}: {exc}; "
+                        f"INT32={type(int32_exc).__name__}: {int32_exc}"
+                    ) from int32_exc
+
+                fallback = {
+                    "trace_index": trace_index,
+                    "trace_id": trace.id,
+                    "requested_encoding": args.encoding,
+                    "actual_encoding": "INT32",
+                    "packing_error": f"{type(exc).__name__}: {exc}",
+                    **diagnostics,
+                }
+                encoding_fallbacks.append(fallback)
+
+                print(
+                    "WARNING: "
+                    f"{args.encoding} cannot encode Trace [{trace_index}] {trace.id}; "
+                    "writing this Trace as INT32 instead. "
+                    f"largest_jump={diagnostics['largest_jump']} "
+                    f"({diagnostics['sample_before']} -> {diagnostics['sample_after']}) "
+                    f"at {diagnostics['jump_time']}",
+                    file=sys.stderr,
+                )
+
+                backend_state.used.add("memory")
+                yield from base.iter_packed_records(payload, trace, args, timings)
+                return
+
+            if backend_state.requested == "memory":
+                raise
+
+            # Non-encoding RAM failures may still use the original disk backend.
+            backend_state.active = "disk"
+            backend_state.fallback_reason = (
+                f"trace {trace_index} {trace.id}: {type(exc).__name__}: {exc}"
+            )
+            print(
+                "WARNING: sequential RAM MiniSEED packing failed for a "
+                "non-encoding reason; switching to robust disk backend: "
+                f"{backend_state.fallback_reason}",
+                file=sys.stderr,
+            )
+        else:
+            backend_state.used.add("memory")
+            yield from base.iter_packed_records(payload, trace, args, timings)
+            return
+
+    backend_state.used.add("disk")
+    yield from pack_trace_records_disk_robust(
+        trace,
+        args,
+        temp_dir,
+        trace_index,
+        timings,
+    )
+
 def pack_and_write_sds(
     stream: Stream,
     args: argparse.Namespace,
@@ -540,6 +983,7 @@ def pack_and_write_sds(
     record_counts: dict[Path, int] = defaultdict(int)
     output_handles = {}
     total_records = 0
+    encoding_fallbacks: list[dict] = []
 
     backend_state = base.PackBackendState(
         requested=args.pack_backend,
@@ -552,14 +996,23 @@ def pack_and_write_sds(
 
     if args.pack_workers > 1 and backend_state.active == "memory":
         try:
-            parallel_results = base.pack_stream_in_parallel(stream, args, timings)
+            parallel_results, parallel_fallbacks = pack_stream_in_parallel_robust(
+                stream,
+                args,
+                timings,
+            )
+            encoding_fallbacks.extend(parallel_fallbacks)
         except Exception as exc:
             if backend_state.requested == "memory":
                 raise
-            backend_state.active = "disk"
+            # STEIM range failures are already handled per Trace inside the
+            # parallel workers. Any error reaching here is a different failure;
+            # retry sequentially before considering disk.
+            backend_state.active = "memory"
             backend_state.fallback_reason = f"{type(exc).__name__}: {exc}"
             print(
-                "WARNING: parallel RAM packing failed; switching to disk backend: "
+                "WARNING: parallel RAM packing failed; retrying with "
+                "sequential per-trace RAM packing: "
                 f"{backend_state.fallback_reason}",
                 file=sys.stderr,
             )
@@ -613,17 +1066,18 @@ def pack_and_write_sds(
                     f"parallel packed {trace.id} records={trace_record_count}",
                 )
         else:
-            with tempfile.TemporaryDirectory(prefix="yfile_hybrid_pack_") as temp:
+            with tempfile.TemporaryDirectory(prefix="yfile_hybrid_pack_", ignore_cleanup_errors=True) as temp:
                 temp_dir = Path(temp)
                 for trace_index, trace in enumerate(stream, start=1):
                     trace_record_count = 0
-                    for record_start, record in base.pack_trace_records(
+                    for record_start, record in pack_trace_records_robust(
                         trace,
                         args,
                         temp_dir,
                         trace_index,
                         timings,
                         backend_state,
+                        encoding_fallbacks,
                     ):
                         stage_started = time.perf_counter()
                         day = base.day_start(record_start)
@@ -677,6 +1131,8 @@ def pack_and_write_sds(
             if parallel_results is not None
             else 0
         ),
+        "encoding_fallbacks": encoding_fallbacks,
+        "encoding_fallback_count": len(encoding_fallbacks),
         "pack_execution_mode": (
             "thread_pool_memory"
             if parallel_results is not None
@@ -859,6 +1315,13 @@ def main() -> int:
             timings,
         )
 
+    encoding_fallback_log = output_root / "_mseed_encoding_fallbacks.log"
+    write_encoding_fallback_log(
+        encoding_fallback_log,
+        input_root,
+        write_stats.get("encoding_fallbacks", []),
+    )
+
     elapsed_seconds = time.perf_counter() - started
     finalize_timing_aggregates(
         timings,
@@ -889,6 +1352,13 @@ def main() -> int:
         "existing_sds_traces_read": existing_traces_read,
         "records_written": write_stats["records_written"],
         "samples_written": total_samples,
+        "encoding_fallback_count": write_stats.get("encoding_fallback_count", 0),
+        "encoding_fallback_log": (
+            str(encoding_fallback_log)
+            if write_stats.get("encoding_fallback_count", 0)
+            else None
+        ),
+        "encoding_fallbacks": write_stats.get("encoding_fallbacks", []),
         "encoding": args.encoding,
         "record_length": args.record_length,
         "correct_sid": str(args.correct_sid.resolve()) if corrections is not None else None,
@@ -948,6 +1418,14 @@ def main() -> int:
     if read_errors:
         print(f"WARNING: skipped {len(read_errors)} unreadable source(s)", file=sys.stderr)
         print(f"Read error log: {error_log}", file=sys.stderr)
+    if write_stats.get("encoding_fallback_count", 0):
+        print(
+            "WARNING: "
+            f"{write_stats['encoding_fallback_count']} Trace(s) could not be "
+            f"encoded as {args.encoding} and were written as INT32.",
+            file=sys.stderr,
+        )
+        print(f"Encoding fallback log: {encoding_fallback_log}", file=sys.stderr)
     if args.report:
         print(f"Report: {args.report}")
     return 0
