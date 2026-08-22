@@ -729,13 +729,15 @@ def pack_trace_to_memory_with_encoding(
     return payload
 
 
-def is_steim_pack_error(exc: Exception) -> bool:
+def is_steim_range_error(exc: Exception) -> bool:
+    """
+    Return True only for the specific STEIM sample-difference range failure.
+
+    Other libmseed errors (for example an msr_free()/packing failure) must not
+    be treated as proof that STEIM cannot represent the samples.
+    """
     message = str(exc)
-    return (
-        "Unable to represent difference" in message
-        or "msr_encode_steim" in message
-        or "Error packing data samples" in message
-    )
+    return "Unable to represent difference" in message
 
 
 def write_encoding_fallback_log(
@@ -763,6 +765,7 @@ def write_encoding_fallback_log(
                 f"Time: {item['starttime']} -> {item['endtime']}",
                 f"Requested encoding: {item['requested_encoding']}",
                 f"Actual encoding: {item['actual_encoding']}",
+                f"Fallback reason: {item.get('fallback_reason', 'unspecified')}",
                 f"Samples: npts={item['npts']}, min={item['min_sample']}, max={item['max_sample']}",
                 (
                     "Largest jump: "
@@ -776,6 +779,11 @@ def write_encoding_fallback_log(
                 ),
                 f"Exceeds STEIM2 signed-30-bit range: {item['exceeds_steim2_30bit']}",
                 f"Original packing error: {item['packing_error']}",
+                *(
+                    [f"Sequential retry error: {item['sequential_retry_error']}"]
+                    if item.get("sequential_retry_error")
+                    else []
+                ),
                 "",
             ]
         )
@@ -791,42 +799,55 @@ def write_encoding_fallback_log(
 
 def pack_trace_memory_worker_robust(task):
     """
-    Thread worker: pack with requested encoding, but retry a STEIM range failure
-    as INT32 for this Trace only.
+    Thread worker.
+
+    - A proven STEIM difference-range failure is retried as INT32 immediately.
+    - Any other packing exception is returned to the main thread so that the
+      same Trace can be retried once sequentially with the requested encoding.
     """
     trace_index, trace, encoding, record_length = task
 
     try:
         result = base.pack_trace_memory_worker(task)
-        return result, None
+        return result, None, None
     except Exception as exc:
         if (
-            encoding not in ("STEIM1", "STEIM2")
-            or not is_steim_pack_error(exc)
+            encoding in ("STEIM1", "STEIM2")
+            and is_steim_range_error(exc)
         ):
-            raise
+            diagnostics = steim2_jump_diagnostics(trace)
+            int32_task = (trace_index, trace, "INT32", record_length)
 
-        diagnostics = steim2_jump_diagnostics(trace)
-        int32_task = (trace_index, trace, "INT32", record_length)
+            try:
+                result = base.pack_trace_memory_worker(int32_task)
+            except Exception as int32_exc:
+                raise RuntimeError(
+                    f"{trace.id}: {encoding} range failure and INT32 fallback "
+                    f"also failed. Original={type(exc).__name__}: {exc}; "
+                    f"INT32={type(int32_exc).__name__}: {int32_exc}"
+                ) from int32_exc
 
-        try:
-            result = base.pack_trace_memory_worker(int32_task)
-        except Exception as int32_exc:
-            raise RuntimeError(
-                f"{trace.id}: {encoding} packing failed and INT32 fallback "
-                f"also failed. Original={type(exc).__name__}: {exc}; "
-                f"INT32={type(int32_exc).__name__}: {int32_exc}"
-            ) from int32_exc
+            fallback = {
+                "trace_index": trace_index,
+                "trace_id": trace.id,
+                "requested_encoding": encoding,
+                "actual_encoding": "INT32",
+                "fallback_reason": "steim_difference_range",
+                "packing_error": f"{type(exc).__name__}: {exc}",
+                **diagnostics,
+            }
+            return result, fallback, None
 
-        fallback = {
+        # Do not classify other libmseed failures as STEIM range failures.
+        # Retry this Trace sequentially in the main thread.
+        retry = {
             "trace_index": trace_index,
-            "trace_id": trace.id,
-            "requested_encoding": encoding,
-            "actual_encoding": "INT32",
+            "trace": trace,
+            "encoding": encoding,
+            "record_length": record_length,
             "packing_error": f"{type(exc).__name__}: {exc}",
-            **diagnostics,
         }
-        return result, fallback
+        return None, None, retry
 
 
 def pack_stream_in_parallel_robust(
@@ -835,7 +856,14 @@ def pack_stream_in_parallel_robust(
     timings: dict[str, float],
 ) -> tuple[list[base.PackedTraceResult], list[dict]]:
     """
-    Parallel RAM packing that keeps STEIM compression failures local to a Trace.
+    Parallel RAM packing with precise per-Trace fallback behavior.
+
+    Proven STEIM range failure:
+        parallel STEIM -> INT32 for that Trace only.
+
+    Any other worker/libmseed failure:
+        retry once sequentially with the requested encoding;
+        if that also fails, preserve the Trace as INT32 and log the reason.
     """
     tasks = [
         (
@@ -852,13 +880,98 @@ def pack_stream_in_parallel_robust(
         max_workers=min(args.pack_workers, max(1, len(tasks))),
         thread_name_prefix="mseed-pack",
     ) as executor:
-        pairs = list(executor.map(pack_trace_memory_worker_robust, tasks))
+        triples = list(executor.map(pack_trace_memory_worker_robust, tasks))
     timings["parallel_pack_wall"] += time.perf_counter() - started
 
     results: list[base.PackedTraceResult] = []
     fallbacks: list[dict] = []
 
-    for result, fallback in pairs:
+    for expected_index, (result, fallback, retry) in enumerate(triples, start=1):
+        if retry is not None:
+            trace = retry["trace"]
+            requested_encoding = retry["encoding"]
+            original_error = retry["packing_error"]
+
+            # First retry the exact same encoding sequentially. This separates
+            # transient/thread-related libmseed failures from true data-range
+            # failures.
+            try:
+                sequential_task = (
+                    retry["trace_index"],
+                    trace,
+                    requested_encoding,
+                    retry["record_length"],
+                )
+                result = base.pack_trace_memory_worker(sequential_task)
+            except Exception as sequential_exc:
+                if (
+                    requested_encoding in ("STEIM1", "STEIM2")
+                    and is_steim_range_error(sequential_exc)
+                ):
+                    fallback_reason = "steim_difference_range_after_sequential_retry"
+                else:
+                    fallback_reason = "non_range_pack_error_after_sequential_retry"
+
+                diagnostics = steim2_jump_diagnostics(trace)
+
+                try:
+                    int32_task = (
+                        retry["trace_index"],
+                        trace,
+                        "INT32",
+                        retry["record_length"],
+                    )
+                    result = base.pack_trace_memory_worker(int32_task)
+                except Exception as int32_exc:
+                    raise RuntimeError(
+                        f"{trace.id}: parallel {requested_encoding} packing failed, "
+                        f"sequential retry failed, and INT32 fallback also failed. "
+                        f"Parallel={original_error}; "
+                        f"Sequential={type(sequential_exc).__name__}: {sequential_exc}; "
+                        f"INT32={type(int32_exc).__name__}: {int32_exc}"
+                    ) from int32_exc
+
+                fallback = {
+                    "trace_index": retry["trace_index"],
+                    "trace_id": trace.id,
+                    "requested_encoding": requested_encoding,
+                    "actual_encoding": "INT32",
+                    "fallback_reason": fallback_reason,
+                    "packing_error": original_error,
+                    "sequential_retry_error": (
+                        f"{type(sequential_exc).__name__}: {sequential_exc}"
+                    ),
+                    **diagnostics,
+                }
+
+                print(
+                    "WARNING: "
+                    f"{requested_encoding} failed for Trace "
+                    f"[{retry['trace_index']}] {trace.id} in parallel and again "
+                    "during sequential retry; writing this Trace as INT32. "
+                    f"reason={fallback_reason}",
+                    file=sys.stderr,
+                )
+            else:
+                print(
+                    "WARNING: "
+                    f"parallel {requested_encoding} packing transiently failed for "
+                    f"Trace [{retry['trace_index']}] {trace.id}; "
+                    "sequential retry succeeded with the original encoding.",
+                    file=sys.stderr,
+                )
+
+        if result is None:
+            raise RuntimeError(
+                f"internal error: missing packed result for Trace {expected_index}"
+            )
+
+        if result.trace_index != expected_index:
+            raise RuntimeError(
+                "parallel pack result order mismatch after fallback handling: "
+                f"expected={expected_index}, actual={result.trace_index}"
+            )
+
         results.append(result)
         timings["pack_thread_mseed_write_sum"] += result.mseed_write_seconds
         timings["pack_thread_buffer_copy_sum"] += result.buffer_copy_seconds
@@ -867,16 +980,18 @@ def pack_stream_in_parallel_robust(
 
         if fallback is not None:
             fallbacks.append(fallback)
-            print(
-                "WARNING: "
-                f"{fallback['requested_encoding']} cannot encode Trace "
-                f"[{fallback['trace_index']}] {fallback['trace_id']}; "
-                "packed this Trace as INT32 instead. "
-                f"largest_jump={fallback['largest_jump']} "
-                f"({fallback['sample_before']} -> {fallback['sample_after']}) "
-                f"at {fallback['jump_time']}",
-                file=sys.stderr,
-            )
+
+            if fallback["fallback_reason"].startswith("steim_difference_range"):
+                print(
+                    "WARNING: "
+                    f"{fallback['requested_encoding']} cannot represent a sample "
+                    f"difference in Trace [{fallback['trace_index']}] "
+                    f"{fallback['trace_id']}; packed this Trace as INT32. "
+                    f"largest_jump={fallback['largest_jump']} "
+                    f"({fallback['sample_before']} -> {fallback['sample_after']}) "
+                    f"at {fallback['jump_time']}",
+                    file=sys.stderr,
+                )
 
     return results, fallbacks
 
@@ -904,7 +1019,7 @@ def pack_trace_records_robust(
             # range error. Preserve every sample by writing this Trace as INT32.
             if (
                 args.encoding in ("STEIM1", "STEIM2")
-                and is_steim_pack_error(exc)
+                and is_steim_range_error(exc)
             ):
                 diagnostics = steim2_jump_diagnostics(trace)
 
@@ -927,6 +1042,7 @@ def pack_trace_records_robust(
                     "trace_id": trace.id,
                     "requested_encoding": args.encoding,
                     "actual_encoding": "INT32",
+                    "fallback_reason": "steim_difference_range",
                     "packing_error": f"{type(exc).__name__}: {exc}",
                     **diagnostics,
                 }
@@ -1421,8 +1537,8 @@ def main() -> int:
     if write_stats.get("encoding_fallback_count", 0):
         print(
             "WARNING: "
-            f"{write_stats['encoding_fallback_count']} Trace(s) could not be "
-            f"encoded as {args.encoding} and were written as INT32.",
+            f"{write_stats['encoding_fallback_count']} Trace(s) required "
+            f"INT32 fallback after {args.encoding} packing problems.",
             file=sys.stderr,
         )
         print(f"Encoding fallback log: {encoding_fallback_log}", file=sys.stderr)
