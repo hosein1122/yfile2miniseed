@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import copy
+import gc
 import io
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -90,6 +93,24 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--pack-backend", choices=("auto", "memory", "disk"), default="auto")
     parser.add_argument("--pack-workers", type=int, default=4)
+    parser.add_argument(
+        "--memory-reserve-mb",
+        type=int,
+        default=0,
+        help=(
+            "Physical RAM to keep available before automatic spill-to-disk. "
+            "0 = auto: max(2048 MB, 10%% of physical RAM), capped at 50%%."
+        ),
+    )
+    parser.add_argument(
+        "--memory-spill-chunk-mb",
+        type=int,
+        default=256,
+        help=(
+            "Maximum raw int32 trace bytes drained per spill/merge chunk. "
+            "Default: 256 MB."
+        ),
+    )
     args = parser.parse_args()
 
     if args.progress_every < 1:
@@ -98,6 +119,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--pack-workers must be at least 1")
     if args.pack_backend == "disk" and args.pack_workers > 1:
         parser.error("--pack-workers greater than 1 requires memory/auto packing")
+    if args.memory_reserve_mb < 0:
+        parser.error("--memory-reserve-mb must be >= 0")
+    if args.memory_spill_chunk_mb < 16:
+        parser.error("--memory-spill-chunk-mb must be at least 16")
     return args
 
 
@@ -321,11 +346,336 @@ def trace_from_cpp_record(record: dict) -> Trace:
     return trace
 
 
+
+GIB = 1024 ** 3
+MIB = 1024 ** 2
+
+
+def physical_memory_status() -> tuple[int, int]:
+    """
+    Return (total_physical_bytes, available_physical_bytes).
+
+    Windows uses GlobalMemoryStatusEx directly, so no third-party dependency
+    such as psutil is required. A POSIX fallback is included for portability.
+    """
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", wintypes.DWORD),
+                ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MEMORYSTATUSEX()
+        status.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if not ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            raise OSError("GlobalMemoryStatusEx failed")
+        return int(status.ullTotalPhys), int(status.ullAvailPhys)
+
+    # Portable fallback for Linux/macOS-like environments.
+    try:
+        page_size = int(os.sysconf("SC_PAGE_SIZE"))
+        total_pages = int(os.sysconf("SC_PHYS_PAGES"))
+        available_pages = int(os.sysconf("SC_AVPHYS_PAGES"))
+        return page_size * total_pages, page_size * available_pages
+    except (AttributeError, ValueError, OSError):
+        # Last-resort conservative values; memory spill still has the
+        # MemoryError safety net.
+        return 8 * GIB, 4 * GIB
+
+
+def resolve_memory_reserve_bytes(args: argparse.Namespace, total_bytes: int) -> int:
+    if args.memory_reserve_mb > 0:
+        requested = int(args.memory_reserve_mb) * MIB
+    else:
+        requested = max(2 * GIB, int(total_bytes * 0.10))
+
+    # Never reserve more than half of physical RAM, and keep at least
+    # 512 MB on very small systems.
+    return min(requested, max(512 * MIB, total_bytes // 2))
+
+
+def format_bytes(value: int) -> str:
+    value = int(value)
+    if value >= GIB:
+        return f"{value / GIB:.2f} GiB"
+    if value >= MIB:
+        return f"{value / MIB:.1f} MiB"
+    return f"{value} B"
+
+
+def stream_raw_bytes(stream: Stream) -> int:
+    return sum(int(getattr(trace.data, "nbytes", 0)) for trace in stream)
+
+
+def make_spill_args(args: argparse.Namespace) -> argparse.Namespace:
+    """
+    Temporary spill SDS is intentionally INT32 and sequential.
+
+    It is lossless, avoids STEIM range failures during emergency spilling, and
+    avoids creating a second large parallel packed-result list while RAM is low.
+    """
+    spill_args = copy.copy(args)
+    spill_args.encoding = "INT32"
+    spill_args.pack_workers = 1
+    spill_args.pack_backend = "auto"
+    return spill_args
+
+
+def load_overlay_existing_for_new_data(
+    overlay_root: Path,
+    fallback_root: Path | None,
+    new_stream: Stream,
+    timings: dict[str, float],
+) -> tuple[Stream, set[Path], set[Path], int]:
+    """
+    Copy-on-write SDS read.
+
+    Prefer an already modified file in overlay_root. If it does not exist yet,
+    read the corresponding file from fallback_root (normally the real SDS
+    output tree).
+    """
+    overlay_paths = affected_sds_paths(overlay_root, new_stream)
+    existing = Stream()
+    fallback_files_read: set[Path] = set()
+    traces_read = 0
+
+    stage_started = time.perf_counter()
+    for overlay_path in sorted(overlay_paths):
+        relative = overlay_path.relative_to(overlay_root)
+
+        if overlay_path.exists():
+            source_path = overlay_path
+        elif fallback_root is not None:
+            candidate = fallback_root / relative
+            if candidate.exists():
+                source_path = candidate
+                fallback_files_read.add(candidate)
+            else:
+                continue
+        else:
+            continue
+
+        part = obspy.read(str(source_path), format="MSEED", check_compression=False)
+        existing += part
+        traces_read += len(part)
+
+    base.add_timing(timings, "existing_sds_read", stage_started)
+    return existing, overlay_paths, fallback_files_read, traces_read
+
+
+def flush_stream_to_overlay(
+    stream: Stream,
+    overlay_root: Path,
+    args: argparse.Namespace,
+    timings: dict[str, float],
+    fallback_root: Path | None = None,
+) -> dict:
+    """
+    Merge one manageable Stream chunk into a copy-on-write SDS overlay.
+
+    The function only commits complete staged files, so a failed chunk does not
+    partially replace the working SDS files.
+    """
+    if not stream:
+        return {
+            "write_stats": None,
+            "backend_state": None,
+            "replaced_files": 0,
+            "fallback_files_read": set(),
+            "existing_traces_read": 0,
+            "candidate_paths": set(),
+            "merged_samples": 0,
+            "merged_trace_count": 0,
+        }
+
+    existing, candidate_paths, fallback_files_read, existing_traces_read = (
+        load_overlay_existing_for_new_data(
+            overlay_root,
+            fallback_root,
+            stream,
+            timings,
+        )
+    )
+
+    # A new Stream container avoids altering the caller's trace list. No sample
+    # array copy is made here.
+    combined = Stream(traces=list(stream.traces))
+    if existing:
+        combined += existing
+
+    stage_started = time.perf_counter()
+    combined.sort(keys=["network", "station", "location", "channel", "starttime", "endtime"])
+    base.add_timing(timings, "sort_before_merge", stage_started)
+
+    stage_started = time.perf_counter()
+    combined.merge(method=-1)
+    base.add_timing(timings, "merge_method_minus_1", stage_started)
+
+    stage_started = time.perf_counter()
+    combined.sort(keys=["network", "station", "location", "channel", "starttime", "endtime"])
+    base.add_timing(timings, "sort_after_merge", stage_started)
+
+    merged_samples = sum(int(trace.stats.npts) for trace in combined)
+
+    with tempfile.TemporaryDirectory(prefix="yfile_hybrid_overlay_stage_") as stage_temp:
+        staging_root = Path(stage_temp)
+        write_stats, backend_state = pack_and_write_sds(
+            combined,
+            args,
+            staging_root,
+            timings,
+        )
+        replaced_files = replace_staged_sds_files(
+            staging_root,
+            overlay_root,
+            write_stats["record_counts"],
+            timings,
+        )
+
+    result = {
+        "write_stats": write_stats,
+        "backend_state": backend_state,
+        "replaced_files": replaced_files,
+        "fallback_files_read": fallback_files_read,
+        "existing_traces_read": existing_traces_read,
+        "candidate_paths": candidate_paths,
+        "merged_samples": merged_samples,
+        "merged_trace_count": len(combined),
+    }
+
+    del combined
+    del existing
+    return result
+
+
+def drain_batch_to_overlay(
+    batch: Stream,
+    overlay_root: Path,
+    args: argparse.Namespace,
+    timings: dict[str, float],
+    fallback_root: Path | None = None,
+) -> dict:
+    """
+    Destructively drain a large in-RAM batch into the SDS overlay in bounded
+    raw-data chunks. Trace objects are removed from batch before each flush so
+    RAM is released progressively.
+    """
+    max_chunk_bytes = int(args.memory_spill_chunk_mb) * MIB
+    spill_args = make_spill_args(args) if fallback_root is None else copy.copy(args)
+
+    # Final copy-on-write integration also stays sequential to keep RAM bounded.
+    if fallback_root is not None:
+        spill_args.pack_workers = 1
+
+    stats = {
+        "flush_chunks": 0,
+        "traces_flushed": 0,
+        "raw_bytes_flushed": 0,
+        "records_written_sum": 0,
+        "encoding_fallbacks": [],
+        "fallback_files_read": set(),
+        "existing_traces_read": 0,
+        "candidate_paths": set(),
+        "backends_used": set(),
+        "backend_final": None,
+        "backend_fallback_reason": None,
+    }
+
+    while batch.traces:
+        chunk_count = 0
+        chunk_bytes = 0
+
+        for trace in batch.traces:
+            trace_bytes = int(getattr(trace.data, "nbytes", 0))
+            if chunk_count > 0 and chunk_bytes + trace_bytes > max_chunk_bytes:
+                break
+            chunk_count += 1
+            chunk_bytes += trace_bytes
+            if chunk_bytes >= max_chunk_bytes:
+                break
+
+        if chunk_count <= 0:
+            chunk_count = 1
+
+        chunk_traces = batch.traces[:chunk_count]
+        del batch.traces[:chunk_count]
+        chunk = Stream(traces=chunk_traces)
+
+        try:
+            result = flush_stream_to_overlay(
+                chunk,
+                overlay_root,
+                spill_args,
+                timings,
+                fallback_root=fallback_root,
+            )
+        except MemoryError as exc:
+            # The chunk is already intentionally small. One forced collection
+            # and retry protects against a transient allocator failure.
+            gc.collect()
+            try:
+                result = flush_stream_to_overlay(
+                    chunk,
+                    overlay_root,
+                    spill_args,
+                    timings,
+                    fallback_root=fallback_root,
+                )
+            except MemoryError as retry_exc:
+                # Put the not-yet-committed traces back at the front. Never
+                # silently lose a source because RAM is exhausted.
+                batch.traces[0:0] = chunk.traces
+                raise RuntimeError(
+                    "Out of physical memory while spilling a bounded trace "
+                    f"chunk ({format_bytes(chunk_bytes)}). No input trace was "
+                    "discarded. Increase --memory-reserve-mb or reduce "
+                    "--memory-spill-chunk-mb."
+                ) from retry_exc
+
+        write_stats = result["write_stats"]
+        backend_state = result["backend_state"]
+
+        stats["flush_chunks"] += 1
+        stats["traces_flushed"] += len(chunk)
+        stats["raw_bytes_flushed"] += chunk_bytes
+        stats["fallback_files_read"].update(result["fallback_files_read"])
+        stats["existing_traces_read"] += result["existing_traces_read"]
+        stats["candidate_paths"].update(result["candidate_paths"])
+
+        if write_stats is not None:
+            stats["records_written_sum"] += int(write_stats["records_written"])
+            stats["encoding_fallbacks"].extend(
+                write_stats.get("encoding_fallbacks", [])
+            )
+
+        if backend_state is not None:
+            stats["backends_used"].update(backend_state.used)
+            stats["backend_final"] = backend_state.active
+            if backend_state.fallback_reason:
+                stats["backend_fallback_reason"] = backend_state.fallback_reason
+
+        del chunk
+        gc.collect()
+
+    return stats
+
+
 def read_stream_from_extension(
     args: argparse.Namespace,
     input_root: Path,
     corrections: dict[str, tuple[str, str, str, str]] | None,
     timings: dict[str, float],
+    spill_root: Path | None = None,
 ) -> tuple[Stream, dict]:
     if yfile2obspy_cpp is None:
         raise RuntimeError("yfile2obspy_cpp is not importable")
@@ -334,7 +684,19 @@ def read_stream_from_extension(
     if not sources:
         raise RuntimeError(f"no input files matched {args.pattern!r} under {input_root}")
 
-    stream = Stream()
+    total_physical, available_physical = physical_memory_status()
+    reserve_bytes = resolve_memory_reserve_bytes(args, total_physical)
+
+    print(
+        "Memory policy: "
+        f"physical={format_bytes(total_physical)}, "
+        f"available={format_bytes(available_physical)}, "
+        f"reserve={format_bytes(reserve_bytes)}, "
+        f"spill-chunk={args.memory_spill_chunk_mb} MiB"
+    )
+
+    batch = Stream()
+    batch_raw_bytes = 0
     sample_count = 0
     source_bytes_done = 0
     successful_source_bytes = 0
@@ -344,47 +706,211 @@ def read_stream_from_extension(
     read_errors: list[dict] = []
     total_source_bytes = sum(source.uncompressed_size for source in sources)
 
+    spill_used = False
+    memory_spill_events = 0
+    spill_flush_chunks = 0
+    spilled_trace_count = 0
+    spilled_raw_bytes = 0
+    min_available_bytes = available_physical
+    peak_batch_raw_bytes = 0
+
+    if spill_root is None:
+        # The caller normally supplies a TemporaryDirectory-backed root whose
+        # lifetime covers reading and finalization.
+        spill_root = Path(tempfile.mkdtemp(prefix="yfile_hybrid_newdata_"))
+
+    spill_root.mkdir(parents=True, exist_ok=True)
+
+    def current_available() -> int:
+        nonlocal min_available_bytes
+        _, available = physical_memory_status()
+        min_available_bytes = min(min_available_bytes, available)
+        return available
+
+    def spill_batch(reason: str) -> None:
+        nonlocal spill_used
+        nonlocal memory_spill_events
+        nonlocal spill_flush_chunks
+        nonlocal spilled_trace_count
+        nonlocal spilled_raw_bytes
+        nonlocal batch_raw_bytes
+
+        if not batch:
+            return
+
+        before_bytes = batch_raw_bytes
+        available = current_available()
+
+        print(
+            "MEMORY SPILL: "
+            f"{reason}; batch_traces={len(batch)}, "
+            f"batch_raw={format_bytes(before_bytes)}, "
+            f"available={format_bytes(available)}, "
+            f"reserve={format_bytes(reserve_bytes)}"
+        )
+
+        spill_stats = drain_batch_to_overlay(
+            batch,
+            spill_root,
+            args,
+            timings,
+            fallback_root=None,
+        )
+
+        spill_used = True
+        memory_spill_events += 1
+        spill_flush_chunks += int(spill_stats["flush_chunks"])
+        spilled_trace_count += int(spill_stats["traces_flushed"])
+        spilled_raw_bytes += int(spill_stats["raw_bytes_flushed"])
+        batch_raw_bytes = 0
+        gc.collect()
+
+        available_after = current_available()
+        print(
+            "MEMORY SPILL completed: "
+            f"available={format_bytes(available_after)}"
+        )
+
     started = time.perf_counter()
     with base.InputSourceReader() as source_reader:
         for index, source in enumerate(sources, start=1):
-            stage_started = time.perf_counter()
-            try:
-                if source.is_archive_member:
-                    payload, decompress_elapsed = source_reader.read_archive_payload(source)
-                    timings["archive_decompress"] += decompress_elapsed
-                    record = yfile2obspy_cpp.read_yfile_bytes(payload)
+            # Proactive spill: do not wait for the next allocation to fail.
+            if batch and current_available() <= reserve_bytes:
+                spill_batch("available physical RAM reached reserve threshold")
+
+            # ----------------------- source read -----------------------
+            record = None
+            read_retry = 0
+
+            while True:
+                stage_started = time.perf_counter()
+                try:
+                    if source.is_archive_member:
+                        payload, decompress_elapsed = source_reader.read_archive_payload(source)
+                        timings["archive_decompress"] += decompress_elapsed
+                        try:
+                            record = yfile2obspy_cpp.read_yfile_bytes(payload)
+                        finally:
+                            del payload
+                    else:
+                        record = yfile2obspy_cpp.read_yfile_path(str(source.container))
+                except MemoryError:
+                    base.add_timing(timings, "cpp_extension_read", stage_started)
+
+                    if batch:
+                        spill_batch(
+                            f"MemoryError while reading source [{index}/{len(sources)}]; "
+                            "retrying the same source"
+                        )
+                        read_retry += 1
+                        gc.collect()
+                        if read_retry <= 2:
+                            continue
+
+                    if read_retry == 0:
+                        read_retry += 1
+                        gc.collect()
+                        continue
+
+                    raise RuntimeError(
+                        "Out of memory while reading one Y source even after "
+                        "spilling all buffered traces. The source was NOT skipped: "
+                        f"{source.display_name}"
+                    )
+                except Exception as exc:
+                    base.add_timing(timings, "cpp_extension_read", stage_started)
+                    source_bytes_done += source.uncompressed_size
+                    read_errors.append(
+                        {
+                            "index": index,
+                            "total": len(sources),
+                            "source": source.display_name,
+                            "source_bytes": int(source.uncompressed_size),
+                            "error_type": type(exc).__name__,
+                            "error": str(exc),
+                        }
+                    )
+                    print(
+                        f"WARNING: skipped unreadable Y source [{index}/{len(sources)}] "
+                        f"{source.display_name}: {type(exc).__name__}: {exc}",
+                        file=sys.stderr,
+                    )
+                    print_bridge_progress(
+                        args,
+                        timings,
+                        index,
+                        len(sources),
+                        source_bytes_done,
+                        total_source_bytes,
+                        f"skipped unreadable source {source.display_name}",
+                    )
+                    record = None
+                    break
                 else:
-                    record = yfile2obspy_cpp.read_yfile_path(str(source.container))
-            except Exception as exc:
-                base.add_timing(timings, "cpp_extension_read", stage_started)
-                source_bytes_done += source.uncompressed_size
-                read_errors.append(
-                    {
-                        "index": index,
-                        "total": len(sources),
-                        "source": source.display_name,
-                        "source_bytes": int(source.uncompressed_size),
-                        "error_type": type(exc).__name__,
-                        "error": str(exc),
-                    }
-                )
-                print(
-                    f"WARNING: skipped unreadable Y source [{index}/{len(sources)}] "
-                    f"{source.display_name}: {type(exc).__name__}: {exc}",
-                    file=sys.stderr,
-                )
-                print_bridge_progress(
-                    args,
-                    timings,
-                    index,
-                    len(sources),
-                    source_bytes_done,
-                    total_source_bytes,
-                    f"skipped unreadable source {source.display_name}",
-                )
+                    base.add_timing(timings, "cpp_extension_read", stage_started)
+                    break
+
+            if record is None:
                 continue
 
-            base.add_timing(timings, "cpp_extension_read", stage_started)
+            # ----------------------- Trace build -----------------------
+            build_retry = 0
+            while True:
+                try:
+                    stage_started = time.perf_counter()
+                    current = Stream([trace_from_cpp_record(record)])
+                    base.add_timing(timings, "cpp_extension_trace_build", stage_started)
+
+                    stage_started = time.perf_counter()
+                    base.apply_metadata(current, args, source.display_name, corrections)
+                    base.add_timing(timings, "metadata_apply", stage_started)
+                    break
+                except MemoryError:
+                    if batch:
+                        spill_batch(
+                            f"MemoryError while building Trace [{index}/{len(sources)}]; "
+                            "retrying without rereading the source"
+                        )
+                        build_retry += 1
+                        gc.collect()
+                        if build_retry <= 2:
+                            continue
+
+                    if build_retry == 0:
+                        build_retry += 1
+                        gc.collect()
+                        continue
+
+                    raise RuntimeError(
+                        "Out of memory while constructing one Trace even after "
+                        "spilling all buffered traces. The source was NOT skipped: "
+                        f"{source.display_name}"
+                    )
+
+            # ----------------------- append ----------------------------
+            append_retry = 0
+            while True:
+                try:
+                    stage_started = time.perf_counter()
+                    batch += current
+                    base.add_timing(timings, "stream_append", stage_started)
+                    break
+                except MemoryError:
+                    if batch:
+                        spill_batch(
+                            f"MemoryError while appending Trace [{index}/{len(sources)}]; "
+                            "retrying the same Trace"
+                        )
+                        append_retry += 1
+                        gc.collect()
+                        if append_retry <= 2:
+                            continue
+
+                    raise RuntimeError(
+                        "Out of memory while appending a single Trace after "
+                        "spilling all buffered data. The source was NOT skipped: "
+                        f"{source.display_name}"
+                    )
 
             if source.is_archive_member:
                 if source.is_zip_member:
@@ -394,24 +920,18 @@ def read_stream_from_extension(
             else:
                 plain_count += 1
 
-            # Metadata/configuration errors are intentionally NOT skipped.
-            # A missing CorrectSID entry is a configuration problem, not a bad Y-file.
-            stage_started = time.perf_counter()
-            current = Stream([trace_from_cpp_record(record)])
-            base.add_timing(timings, "cpp_extension_trace_build", stage_started)
-
-            stage_started = time.perf_counter()
-            base.apply_metadata(current, args, source.display_name, corrections)
-            base.add_timing(timings, "metadata_apply", stage_started)
-
-            stage_started = time.perf_counter()
-            stream += current
-            base.add_timing(timings, "stream_append", stage_started)
-
             npts = int(record["npts"])
             sample_count += npts
             source_bytes_done += source.uncompressed_size
             successful_source_bytes += source.uncompressed_size
+
+            trace_bytes = int(getattr(current[0].data, "nbytes", 0))
+            batch_raw_bytes += trace_bytes
+            peak_batch_raw_bytes = max(peak_batch_raw_bytes, batch_raw_bytes)
+
+            del record
+            del current
+
             print_bridge_progress(
                 args,
                 timings,
@@ -422,8 +942,17 @@ def read_stream_from_extension(
                 f"C++ extension read {source.display_name}",
             )
 
+            # Post-read check catches a large source that crossed the threshold.
+            if batch and current_available() <= reserve_bytes:
+                spill_batch("available physical RAM fell below reserve after source read")
+
+    # If spill mode was ever needed, keep the whole run in bounded-memory mode.
+    if spill_used and batch:
+        spill_batch("final buffered traces after input scan")
+
     timings["cpp_extension_read_wall"] = time.perf_counter() - started
-    return stream, {
+
+    return batch, {
         "sources_found": len(sources),
         "files_read": len(sources) - len(read_errors),
         "files_skipped": len(read_errors),
@@ -434,6 +963,16 @@ def read_stream_from_extension(
         "total_source_bytes": total_source_bytes,
         "successful_source_bytes": successful_source_bytes,
         "read_errors": read_errors,
+        "memory_spill_used": spill_used,
+        "memory_spill_events": memory_spill_events,
+        "memory_spill_flush_chunks": spill_flush_chunks,
+        "memory_spilled_trace_count": spilled_trace_count,
+        "memory_spilled_raw_bytes": spilled_raw_bytes,
+        "memory_total_physical_bytes": total_physical,
+        "memory_reserve_bytes": reserve_bytes,
+        "memory_min_available_bytes": min_available_bytes,
+        "memory_peak_batch_raw_bytes": peak_batch_raw_bytes,
+        "spill_root": str(spill_root) if spill_used else None,
     }
 
 
@@ -1006,81 +1545,161 @@ def pack_trace_records_robust(
     encoding_fallbacks: list[dict],
 ):
     """
-    Prefer per-trace RAM packing.
+    Bounded-memory per-Trace packing.
 
-    If STEIM compression cannot represent a sample difference, retry ONLY this
-    Trace as INT32. Disk fallback is reserved for non-encoding RAM failures.
+    STEIM range failure:
+        immediately preserve this Trace as INT32.
+
+    Other non-memory libmseed failure:
+        retry once with the same requested encoding; if it fails again,
+        preserve this Trace as INT32 and log the exact reason.
+
+    MemoryError:
+        in auto mode switch to the disk backend, because retrying another
+        in-memory encoding would not solve physical-memory exhaustion.
     """
+
+    def emit_int32_fallback(
+        original_exc: Exception,
+        reason: str,
+        retry_exc: Exception | None = None,
+    ):
+        diagnostics = steim2_jump_diagnostics(trace)
+
+        try:
+            payload_ = pack_trace_to_memory_with_encoding(
+                trace,
+                args,
+                "INT32",
+                timings,
+            )
+        except MemoryError:
+            # INT32 memory packing can itself be impossible under genuine RAM
+            # pressure. Let the caller use disk rather than losing the Trace.
+            raise
+        except Exception as int32_exc:
+            raise RuntimeError(
+                f"{trace.id}: {args.encoding} packing failed and INT32 "
+                f"fallback also failed. Original={type(original_exc).__name__}: "
+                f"{original_exc}; INT32={type(int32_exc).__name__}: {int32_exc}"
+            ) from int32_exc
+
+        fallback = {
+            "trace_index": trace_index,
+            "trace_id": trace.id,
+            "requested_encoding": args.encoding,
+            "actual_encoding": "INT32",
+            "fallback_reason": reason,
+            "packing_error": f"{type(original_exc).__name__}: {original_exc}",
+            **diagnostics,
+        }
+        if retry_exc is not None:
+            fallback["sequential_retry_error"] = (
+                f"{type(retry_exc).__name__}: {retry_exc}"
+            )
+
+        encoding_fallbacks.append(fallback)
+        backend_state.used.add("memory")
+
+        print(
+            "WARNING: "
+            f"{args.encoding} packing fallback for Trace [{trace_index}] "
+            f"{trace.id}; writing this Trace as INT32. reason={reason}",
+            file=sys.stderr,
+        )
+
+        yield from base.iter_packed_records(payload_, trace, args, timings)
+
     if backend_state.active == "memory":
         try:
             payload = base.pack_trace_to_memory(trace, args, timings)
+        except MemoryError as exc:
+            if backend_state.requested == "memory":
+                raise
+
+            backend_state.active = "disk"
+            backend_state.fallback_reason = (
+                f"trace {trace_index} {trace.id}: MemoryError: {exc}"
+            )
+            print(
+                "WARNING: in-memory MiniSEED packing ran out of RAM; "
+                "switching to robust disk backend for subsequent Trace(s): "
+                f"{backend_state.fallback_reason}",
+                file=sys.stderr,
+            )
+
         except Exception as exc:
-            # A disk retry with the same STEIM encoding cannot fix an encoding
-            # range error. Preserve every sample by writing this Trace as INT32.
             if (
                 args.encoding in ("STEIM1", "STEIM2")
                 and is_steim_range_error(exc)
             ):
-                diagnostics = steim2_jump_diagnostics(trace)
+                yield from emit_int32_fallback(
+                    exc,
+                    "steim_difference_range",
+                )
+                return
 
-                try:
-                    payload = pack_trace_to_memory_with_encoding(
-                        trace,
-                        args,
-                        "INT32",
-                        timings,
-                    )
-                except Exception as int32_exc:
-                    raise RuntimeError(
-                        f"{trace.id}: {args.encoding} packing failed and INT32 "
-                        f"fallback also failed. Original={type(exc).__name__}: {exc}; "
-                        f"INT32={type(int32_exc).__name__}: {int32_exc}"
-                    ) from int32_exc
+            # This covers transient libmseed failures such as the previously
+            # observed msr_free() error. Retry once with the same encoding
+            # before changing representation.
+            gc.collect()
+            try:
+                payload = base.pack_trace_to_memory(trace, args, timings)
+            except MemoryError as retry_exc:
+                if backend_state.requested == "memory":
+                    raise
 
-                fallback = {
-                    "trace_index": trace_index,
-                    "trace_id": trace.id,
-                    "requested_encoding": args.encoding,
-                    "actual_encoding": "INT32",
-                    "fallback_reason": "steim_difference_range",
-                    "packing_error": f"{type(exc).__name__}: {exc}",
-                    **diagnostics,
-                }
-                encoding_fallbacks.append(fallback)
-
+                backend_state.active = "disk"
+                backend_state.fallback_reason = (
+                    f"trace {trace_index} {trace.id}: MemoryError on retry: "
+                    f"{retry_exc}"
+                )
                 print(
-                    "WARNING: "
-                    f"{args.encoding} cannot encode Trace [{trace_index}] {trace.id}; "
-                    "writing this Trace as INT32 instead. "
-                    f"largest_jump={diagnostics['largest_jump']} "
-                    f"({diagnostics['sample_before']} -> {diagnostics['sample_after']}) "
-                    f"at {diagnostics['jump_time']}",
+                    "WARNING: sequential packing retry ran out of RAM; "
+                    "switching to robust disk backend: "
+                    f"{backend_state.fallback_reason}",
                     file=sys.stderr,
                 )
 
-                backend_state.used.add("memory")
-                yield from base.iter_packed_records(payload, trace, args, timings)
+            except Exception as retry_exc:
+                if (
+                    args.encoding in ("STEIM1", "STEIM2")
+                    and is_steim_range_error(retry_exc)
+                ):
+                    reason = "steim_difference_range_after_sequential_retry"
+                else:
+                    reason = "non_range_pack_error_after_sequential_retry"
+
+                yield from emit_int32_fallback(
+                    exc,
+                    reason,
+                    retry_exc=retry_exc,
+                )
                 return
 
-            if backend_state.requested == "memory":
-                raise
+            else:
+                backend_state.used.add("memory")
+                print(
+                    "WARNING: transient MiniSEED packing failure recovered by "
+                    f"sequential retry for Trace [{trace_index}] {trace.id}.",
+                    file=sys.stderr,
+                )
+                yield from base.iter_packed_records(
+                    payload,
+                    trace,
+                    args,
+                    timings,
+                )
+                return
 
-            # Non-encoding RAM failures may still use the original disk backend.
-            backend_state.active = "disk"
-            backend_state.fallback_reason = (
-                f"trace {trace_index} {trace.id}: {type(exc).__name__}: {exc}"
-            )
-            print(
-                "WARNING: sequential RAM MiniSEED packing failed for a "
-                "non-encoding reason; switching to robust disk backend: "
-                f"{backend_state.fallback_reason}",
-                file=sys.stderr,
-            )
         else:
             backend_state.used.add("memory")
             yield from base.iter_packed_records(payload, trace, args, timings)
             return
 
+    # Genuine RAM-pressure fallback. The disk path uses only a bounded record
+    # buffer and therefore remains available when the in-memory payload cannot
+    # be allocated.
     backend_state.used.add("disk")
     yield from pack_trace_records_disk_robust(
         trace,
@@ -1089,6 +1708,7 @@ def pack_trace_records_robust(
         trace_index,
         timings,
     )
+
 
 def pack_and_write_sds(
     stream: Stream,
@@ -1226,7 +1846,7 @@ def pack_and_write_sds(
         for handle in output_handles.values():
             handle.close()
         base.add_timing(timings, "sds_close_outputs", stage_started)
-        timings["pack_and_sds_pipeline_wall"] = time.perf_counter() - pack_pipeline_started
+        timings["pack_and_sds_pipeline_wall"] += time.perf_counter() - pack_pipeline_started
 
     stage_started = time.perf_counter()
     for path in sorted(record_counts):
@@ -1259,6 +1879,194 @@ def pack_and_write_sds(
             )
         ),
     }, backend_state
+
+
+
+def list_sds_files(root: Path) -> list[Path]:
+    if not root.exists():
+        return []
+    return sorted(path for path in root.rglob("*") if path.is_file())
+
+
+def summarize_staged_sds(
+    root: Path,
+    record_length: int,
+) -> tuple[int, int, int]:
+    """
+    Return (records, samples, trace_segments) without loading waveform samples.
+    """
+    records = 0
+    samples = 0
+    trace_segments = 0
+
+    for path in list_sds_files(root):
+        size = path.stat().st_size
+        if size % record_length != 0:
+            raise RuntimeError(
+                f"staged SDS size is not divisible by record length: {path}"
+            )
+        records += size // record_length
+
+        head = obspy.read(
+            str(path),
+            format="MSEED",
+            headonly=True,
+            check_compression=False,
+        )
+        samples += sum(int(trace.stats.npts) for trace in head)
+        trace_segments += len(head)
+
+    return records, samples, trace_segments
+
+
+def finalize_spilled_new_data(
+    new_work_root: Path,
+    output_root: Path,
+    args: argparse.Namespace,
+    timings: dict[str, float],
+) -> tuple[dict, base.PackBackendState]:
+    """
+    Merge temporary new-data SDS into the real SDS tree using a second
+    copy-on-write overlay. Only one manageable work SDS file is loaded at a
+    time, so the full year is never reconstructed in RAM.
+    """
+    new_files = list_sds_files(new_work_root)
+    if not new_files:
+        raise RuntimeError("memory spill mode produced no temporary SDS files")
+
+    aggregate_fallbacks: list[dict] = []
+    fallback_files_read: set[Path] = set()
+    candidate_paths: set[Path] = set()
+    existing_traces_read = 0
+    backends_used: set[str] = set()
+    backend_final = "memory"
+    backend_fallback_reason = None
+
+    final_args = copy.copy(args)
+    # Bounded-memory finalization: per-work-file parallelism provides little
+    # benefit and can duplicate payload memory.
+    final_args.pack_workers = 1
+
+    with tempfile.TemporaryDirectory(prefix="yfile_hybrid_final_overlay_") as final_temp:
+        final_overlay = Path(final_temp)
+
+        total = len(new_files)
+        for index, work_path in enumerate(new_files, start=1):
+            try:
+                part = obspy.read(
+                    str(work_path),
+                    format="MSEED",
+                    check_compression=False,
+                )
+            except MemoryError as exc:
+                gc.collect()
+                try:
+                    part = obspy.read(
+                        str(work_path),
+                        format="MSEED",
+                        check_compression=False,
+                    )
+                except MemoryError as retry_exc:
+                    raise RuntimeError(
+                        "Out of memory while reading one temporary SDS work file. "
+                        "No final SDS file was partially committed: "
+                        f"{work_path}"
+                    ) from retry_exc
+
+            # This Stream is normally one NET.STA.LOC.CHA.DAY file and is small.
+            merge_result = flush_stream_to_overlay(
+                part,
+                final_overlay,
+                final_args,
+                timings,
+                fallback_root=output_root,
+            )
+
+            write_stats = merge_result["write_stats"]
+            state = merge_result["backend_state"]
+
+            aggregate_fallbacks.extend(
+                write_stats.get("encoding_fallbacks", [])
+                if write_stats is not None
+                else []
+            )
+            fallback_files_read.update(merge_result["fallback_files_read"])
+            candidate_paths.update(merge_result["candidate_paths"])
+            existing_traces_read += int(merge_result["existing_traces_read"])
+
+            if state is not None:
+                backends_used.update(state.used)
+                backend_final = state.active
+                if state.fallback_reason:
+                    backend_fallback_reason = state.fallback_reason
+
+            base.print_progress(
+                args,
+                timings,
+                index,
+                total,
+                f"low-memory finalized {work_path.relative_to(new_work_root)}",
+            )
+
+            del part
+            gc.collect()
+
+        final_files = list_sds_files(final_overlay)
+        record_counts = {
+            path: path.stat().st_size // args.record_length
+            for path in final_files
+        }
+
+        records_written, samples_written, merged_trace_count = summarize_staged_sds(
+            final_overlay,
+            args.record_length,
+        )
+
+        replaced_files = replace_staged_sds_files(
+            final_overlay,
+            output_root,
+            record_counts,
+            timings,
+        )
+
+    # Deduplicate repeated fallback diagnostics if an overlay file happened to
+    # be rewritten more than once.
+    deduped_fallbacks: list[dict] = []
+    seen = set()
+    for item in aggregate_fallbacks:
+        key = (
+            item.get("trace_id"),
+            item.get("starttime"),
+            item.get("endtime"),
+            item.get("fallback_reason"),
+            item.get("jump_time"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_fallbacks.append(item)
+
+    state = base.PackBackendState(
+        requested=args.pack_backend,
+        active=backend_final,
+        used=backends_used or {"memory"},
+        fallback_reason=backend_fallback_reason,
+    )
+
+    return {
+        "sds_files_written": replaced_files,
+        "sds_files_replaced": replaced_files,
+        "records_written": records_written,
+        "samples_written": samples_written,
+        "merged_trace_count": merged_trace_count,
+        "parallel_pack_payload_bytes": 0,
+        "encoding_fallbacks": deduped_fallbacks,
+        "encoding_fallback_count": len(deduped_fallbacks),
+        "pack_execution_mode": "memory_spill_copy_on_write",
+        "existing_sds_candidate_files": len(candidate_paths),
+        "existing_sds_files_read": len(fallback_files_read),
+        "existing_sds_traces_read": existing_traces_read,
+    }, state
 
 
 def finalize_timing_aggregates(
@@ -1378,71 +2186,144 @@ def main() -> int:
     if corrections is not None:
         print(f"Using CorrectSID: {args.correct_sid.resolve()} ({len(corrections)} entries)")
 
-    input_decode_mode = "cpp_extension"
-    if yfile2obspy_cpp is not None:
-        stream, read_stats = read_stream_from_extension(args, input_root, corrections, timings)
-    else:
-        input_decode_mode = "cpp_bridge"
-        stream, read_stats = read_stream_from_bridge(args, input_root, corrections, timings)
-    read_errors = read_stats.get("read_errors", [])
-    error_log = (
-        args.error_log.resolve()
-        if args.error_log is not None
-        else output_root / "_yfile_read_errors.log"
-    )
-    write_read_error_log(error_log, input_root, read_errors)
+    with tempfile.TemporaryDirectory(prefix="yfile_hybrid_newdata_") as newdata_temp:
+        new_work_root = Path(newdata_temp)
 
-    if not stream:
-        raise RuntimeError(
-            "C++ reader returned no usable traces"
-            + (f"; skipped={len(read_errors)}; see {error_log}" if read_errors else "")
+        input_decode_mode = "cpp_extension"
+        if yfile2obspy_cpp is not None:
+            stream, read_stats = read_stream_from_extension(
+                args,
+                input_root,
+                corrections,
+                timings,
+                spill_root=new_work_root,
+            )
+        else:
+            # The legacy bridge fallback is retained for compatibility. Native
+            # extension mode is the fully memory-aware path.
+            input_decode_mode = "cpp_bridge"
+            print(
+                "WARNING: bridge fallback does not support read-stage automatic "
+                "memory spilling; native yfile2obspy_cpp is recommended.",
+                file=sys.stderr,
+            )
+            stream, read_stats = read_stream_from_bridge(
+                args,
+                input_root,
+                corrections,
+                timings,
+            )
+
+        read_errors = read_stats.get("read_errors", [])
+        error_log = (
+            args.error_log.resolve()
+            if args.error_log is not None
+            else output_root / "_yfile_read_errors.log"
         )
+        write_read_error_log(error_log, input_root, read_errors)
 
-    new_trace_count = len(stream)
-    existing_stream, touched_paths, existing_files_read, existing_traces_read = (
-        load_existing_sds_for_new_data(output_root, stream, timings)
-    )
-    if existing_stream:
-        stream += existing_stream
+        spill_mode = bool(read_stats.get("memory_spill_used", False))
 
-    stage_started = time.perf_counter()
-    stream.sort(keys=["network", "station", "location", "channel", "starttime", "endtime"])
-    base.add_timing(timings, "sort_before_merge", stage_started)
+        if spill_mode:
+            if stream:
+                # Defensive: the memory-aware reader normally drains the final
+                # batch once spill mode has started.
+                drain_batch_to_overlay(
+                    stream,
+                    new_work_root,
+                    args,
+                    timings,
+                    fallback_root=None,
+                )
 
-    stage_started = time.perf_counter()
-    stream.merge(method=-1)
-    base.add_timing(timings, "merge_method_minus_1", stage_started)
+            print(
+                "Low-memory finalization: merging temporary new-data SDS into "
+                "the destination one work file at a time."
+            )
 
-    stage_started = time.perf_counter()
-    stream.sort(keys=["network", "station", "location", "channel", "starttime", "endtime"])
-    base.add_timing(timings, "sort_after_merge", stage_started)
+            write_stats, backend_state = finalize_spilled_new_data(
+                new_work_root,
+                output_root,
+                args,
+                timings,
+            )
 
-    stage_started = time.perf_counter()
-    total_samples = sum(int(trace.stats.npts) for trace in stream)
-    base.add_timing(timings, "sample_count", stage_started)
+            replaced_files = write_stats["sds_files_replaced"]
+            existing_files_read = write_stats["existing_sds_files_read"]
+            existing_traces_read = write_stats["existing_sds_traces_read"]
+            touched_path_count = write_stats["existing_sds_candidate_files"]
+            total_samples = write_stats["samples_written"]
+            merged_trace_count = write_stats["merged_trace_count"]
+            new_trace_count = read_stats["files_read"]
 
-    with tempfile.TemporaryDirectory(prefix="yfile_hybrid_sds_stage_") as stage_temp:
-        staging_root = Path(stage_temp)
-        write_stats, backend_state = pack_and_write_sds(stream, args, staging_root, timings)
-        replaced_files = replace_staged_sds_files(
-            staging_root,
-            output_root,
-            write_stats["record_counts"],
-            timings,
+        else:
+            # Fast path: exactly the previous all-in-memory behavior.
+            if not stream:
+                raise RuntimeError(
+                    "C++ reader returned no usable traces"
+                    + (
+                        f"; skipped={len(read_errors)}; see {error_log}"
+                        if read_errors
+                        else ""
+                    )
+                )
+
+            new_trace_count = len(stream)
+            existing_stream, touched_paths, existing_files_read, existing_traces_read = (
+                load_existing_sds_for_new_data(output_root, stream, timings)
+            )
+            if existing_stream:
+                stream += existing_stream
+
+            stage_started = time.perf_counter()
+            stream.sort(keys=["network", "station", "location", "channel", "starttime", "endtime"])
+            base.add_timing(timings, "sort_before_merge", stage_started)
+
+            stage_started = time.perf_counter()
+            stream.merge(method=-1)
+            base.add_timing(timings, "merge_method_minus_1", stage_started)
+
+            stage_started = time.perf_counter()
+            stream.sort(keys=["network", "station", "location", "channel", "starttime", "endtime"])
+            base.add_timing(timings, "sort_after_merge", stage_started)
+
+            stage_started = time.perf_counter()
+            total_samples = sum(int(trace.stats.npts) for trace in stream)
+            base.add_timing(timings, "sample_count", stage_started)
+
+            with tempfile.TemporaryDirectory(prefix="yfile_hybrid_sds_stage_") as stage_temp:
+                staging_root = Path(stage_temp)
+                write_stats, backend_state = pack_and_write_sds(
+                    stream,
+                    args,
+                    staging_root,
+                    timings,
+                )
+                replaced_files = replace_staged_sds_files(
+                    staging_root,
+                    output_root,
+                    write_stats["record_counts"],
+                    timings,
+                )
+
+            touched_path_count = len(touched_paths)
+            merged_trace_count = len(stream)
+
+        encoding_fallback_log = output_root / "_mseed_encoding_fallbacks.log"
+        write_encoding_fallback_log(
+            encoding_fallback_log,
+            input_root,
+            write_stats.get("encoding_fallbacks", []),
         )
-
-    encoding_fallback_log = output_root / "_mseed_encoding_fallbacks.log"
-    write_encoding_fallback_log(
-        encoding_fallback_log,
-        input_root,
-        write_stats.get("encoding_fallbacks", []),
-    )
 
     elapsed_seconds = time.perf_counter() - started
     finalize_timing_aggregates(
         timings,
         elapsed_seconds,
-        write_stats["pack_execution_mode"] == "thread_pool_memory",
+        (
+            not spill_mode
+            and write_stats["pack_execution_mode"] == "thread_pool_memory"
+        ),
     )
 
     report = {
@@ -1463,7 +2344,7 @@ def main() -> int:
         "total_source_bytes": read_stats["total_source_bytes"],
         "sds_files_written": write_stats["sds_files_written"],
         "sds_files_replaced": replaced_files,
-        "existing_sds_candidate_files": len(touched_paths),
+        "existing_sds_candidate_files": touched_path_count,
         "existing_sds_files_read": existing_files_read,
         "existing_sds_traces_read": existing_traces_read,
         "records_written": write_stats["records_written"],
@@ -1483,7 +2364,7 @@ def main() -> int:
         "benchmark": args.benchmark,
         "pack_workers": args.pack_workers,
         "new_trace_count": new_trace_count,
-        "merged_trace_count": len(stream),
+        "merged_trace_count": merged_trace_count,
         "parallel_pack_payload_bytes": write_stats["parallel_pack_payload_bytes"],
         "pack_execution_mode": write_stats["pack_execution_mode"],
         "input_decode_mode": input_decode_mode,
@@ -1491,12 +2372,26 @@ def main() -> int:
         "pack_backends_used": sorted(backend_state.used),
         "pack_backend_final": backend_state.active,
         "pack_backend_fallback_reason": backend_state.fallback_reason,
+        "memory_spill_used": spill_mode,
+        "memory_spill_events": read_stats.get("memory_spill_events", 0),
+        "memory_spill_flush_chunks": read_stats.get("memory_spill_flush_chunks", 0),
+        "memory_spilled_trace_count": read_stats.get("memory_spilled_trace_count", 0),
+        "memory_spilled_raw_bytes": read_stats.get("memory_spilled_raw_bytes", 0),
+        "memory_total_physical_bytes": read_stats.get("memory_total_physical_bytes"),
+        "memory_reserve_bytes": read_stats.get("memory_reserve_bytes"),
+        "memory_min_available_bytes": read_stats.get("memory_min_available_bytes"),
+        "memory_peak_batch_raw_bytes": read_stats.get("memory_peak_batch_raw_bytes"),
+        "memory_spill_chunk_mb": args.memory_spill_chunk_mb,
         "timings_seconds": base.rounded_timings(timings),
         "elapsed_seconds": round(elapsed_seconds, 6),
     }
+
     if args.report:
         args.report.parent.mkdir(parents=True, exist_ok=True)
-        args.report.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        args.report.write_text(
+            json.dumps(report, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     if args.benchmark:
         print()
@@ -1521,7 +2416,10 @@ def main() -> int:
                 continue
             print(f"  {name:30s} {seconds:12.6f} s")
 
-    print("Completed with warnings" if read_errors else "Completed successfully")
+    warning_state = bool(read_errors) or bool(
+        write_stats.get("encoding_fallback_count", 0)
+    )
+    print("Completed with warnings" if warning_state else "Completed successfully")
     print(
         "Summary: "
         f"elapsed={report['elapsed_seconds']:.6f}s, "
@@ -1529,11 +2427,26 @@ def main() -> int:
         f"skipped={report['files_skipped']}, "
         f"samples={report['samples_written']}, "
         f"records={report['records_written']}, "
-        f"sds_files={report['sds_files_replaced']}"
+        f"sds_files={report['sds_files_replaced']}, "
+        f"memory_spill={'yes' if spill_mode else 'no'}"
     )
+
+    if spill_mode:
+        print(
+            "Memory spill summary: "
+            f"events={report['memory_spill_events']}, "
+            f"chunks={report['memory_spill_flush_chunks']}, "
+            f"spilled_raw={format_bytes(report['memory_spilled_raw_bytes'])}, "
+            f"min_available={format_bytes(report['memory_min_available_bytes'])}"
+        )
+
     if read_errors:
-        print(f"WARNING: skipped {len(read_errors)} unreadable source(s)", file=sys.stderr)
+        print(
+            f"WARNING: skipped {len(read_errors)} unreadable source(s)",
+            file=sys.stderr,
+        )
         print(f"Read error log: {error_log}", file=sys.stderr)
+
     if write_stats.get("encoding_fallback_count", 0):
         print(
             "WARNING: "
@@ -1541,7 +2454,11 @@ def main() -> int:
             f"INT32 fallback after {args.encoding} packing problems.",
             file=sys.stderr,
         )
-        print(f"Encoding fallback log: {encoding_fallback_log}", file=sys.stderr)
+        print(
+            f"Encoding fallback log: {encoding_fallback_log}",
+            file=sys.stderr,
+        )
+
     if args.report:
         print(f"Report: {args.report}")
     return 0
